@@ -101,7 +101,7 @@ The crates are published on crates.io:
 
 ```toml
 [dependencies]
-memdiver = "0.1.0"
+memdiver = "0.1.1"
 ```
 
 The workspace publishes `memdiver` (the façade), `memdiver-core` (safe API), and
