@@ -36,6 +36,7 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::ProcessStatus::{
     EnumProcessModulesEx, GetModuleFileNameExW, GetModuleInformation, LIST_MODULES_ALL, MODULEINFO,
 };
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, IsWow64Process, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
     PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -44,8 +45,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::{
-    Error, ErrorKind, PointerWidth, Protection, RawModule, RawProcessInfo, RawRegion, RegionKind,
-    io_message,
+    CodeWriteError, CodeWriteFailure, Error, ErrorKind, PointerWidth, Protection, RawModule,
+    RawProcessInfo, RawRegion, RegionKind, RestoreFailure, io_message,
 };
 
 const READ_WRITE_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_QUERY_INFORMATION
@@ -206,7 +207,8 @@ impl ProcessHandle {
     /// Writes up to `buffer.len()` bytes starting at `address`.
     ///
     /// Returns the number of bytes transferred. A short transfer is not an
-    /// error at this layer.
+    /// error at this layer. Page protection is not changed; use
+    /// [`ProcessHandle::write_code`] when the target page is not writable.
     ///
     /// # Errors
     ///
@@ -233,6 +235,225 @@ impl ProcessHandle {
             return Err(last_error());
         }
         Ok(transferred)
+    }
+
+    /// Writes `buffer` at `address`, temporarily making every page covering the
+    /// range writable and executable, then restoring each page's original
+    /// protection.
+    ///
+    /// Each page is protected individually with `PAGE_EXECUTE_READWRITE`, and
+    /// the exact previous protection returned by `VirtualProtectEx` is retained
+    /// for that page. This avoids relying on the single first-page value that a
+    /// multi-page protection change returns, which would be wrong when pages
+    /// have different protections. Restoration is attempted for every page that
+    /// was changed, even when one restore fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodeWriteError::Failed`] when the write or a protection change
+    /// fails and every protection that was already changed was restored.
+    /// Returns [`CodeWriteError::RestoreFailedAfterWrite`] or
+    /// [`CodeWriteError::RestoreFailedAfterFailure`] when at least one page
+    /// could not be restored. The whole range is checked for committed memory
+    /// before any protection is changed.
+    pub fn write_code(&self, address: u64, buffer: &[u8]) -> Result<usize, CodeWriteError> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let len = buffer.len();
+        let address_usize = checked_address(address, len)
+            .map_err(|source| CodeWriteError::Failed(CodeWriteFailure::Write(source)))?;
+        let end = address_usize.checked_add(len).ok_or_else(|| {
+            CodeWriteError::Failed(CodeWriteFailure::Write(invalid_address(address, len)))
+        })?;
+        self.ensure_range_committed(address_usize, end)?;
+
+        let page_size = system_page_size()?;
+        let first_page = address_usize & !(page_size - 1);
+        let last_page = (end - 1) & !(page_size - 1);
+        let page_count = ((last_page - first_page) / page_size)
+            .checked_add(1)
+            .ok_or_else(|| {
+                CodeWriteError::Failed(CodeWriteFailure::Protect {
+                    address: first_page as u64,
+                    len: end - address_usize,
+                    source: Error::malformed("page count overflowed"),
+                })
+            })?;
+
+        let mut changed: Vec<(usize, PAGE_PROTECTION_FLAGS)> = Vec::new();
+        changed.try_reserve_exact(page_count).map_err(|_| {
+            CodeWriteError::Failed(CodeWriteFailure::Protect {
+                address: first_page as u64,
+                len: page_count.saturating_mul(page_size),
+                source: Error::new(
+                    ErrorKind::Other,
+                    None,
+                    "could not allocate the page protection table",
+                ),
+            })
+        })?;
+
+        for index in 0..page_count {
+            let page = index
+                .checked_mul(page_size)
+                .and_then(|offset| first_page.checked_add(offset))
+                .ok_or_else(|| {
+                    CodeWriteError::Failed(CodeWriteFailure::Protect {
+                        address: first_page as u64,
+                        len: end - address_usize,
+                        source: Error::malformed("page address overflowed"),
+                    })
+                })?;
+            let mut previous: PAGE_PROTECTION_FLAGS = 0;
+            // SAFETY: `page` is a page-aligned address inside a committed range
+            // validated by `ensure_range_committed`, `page_size` is the system
+            // page size, and `previous` is valid for one value.
+            let succeeded = unsafe {
+                VirtualProtectEx(
+                    self.handle.as_handle(),
+                    page as *const c_void,
+                    page_size,
+                    PAGE_EXECUTE_READWRITE,
+                    &mut previous,
+                )
+            };
+            if succeeded == 0 {
+                let failure = CodeWriteFailure::Protect {
+                    address: page as u64,
+                    len: page_size,
+                    source: last_error(),
+                };
+                let (restore, additional_restore_failures) =
+                    self.restore_pages(&changed, page_size);
+                return Err(match restore {
+                    Some(restore) => CodeWriteError::RestoreFailedAfterFailure {
+                        failure,
+                        restore,
+                        additional_restore_failures,
+                    },
+                    None => CodeWriteError::Failed(failure),
+                });
+            }
+            changed.push((page, previous));
+        }
+
+        let write_result = self.write(address, buffer);
+        let (restore, additional_restore_failures) = self.restore_pages(&changed, page_size);
+        match (write_result, restore) {
+            (Ok(transferred), None) => Ok(transferred),
+            (Ok(transferred), Some(restore)) => Err(CodeWriteError::RestoreFailedAfterWrite {
+                transferred,
+                restore,
+                additional_restore_failures,
+            }),
+            (Err(source), None) => Err(CodeWriteError::Failed(CodeWriteFailure::Write(source))),
+            (Err(source), Some(restore)) => Err(CodeWriteError::RestoreFailedAfterFailure {
+                failure: CodeWriteFailure::Write(source),
+                restore,
+                additional_restore_failures,
+            }),
+        }
+    }
+
+    /// Restores every page in `pages` in reverse order.
+    ///
+    /// Returns the first restore failure and the number of additional failures.
+    /// Every page is attempted even after a failure so that as little
+    /// protection as possible is left modified.
+    fn restore_pages(
+        &self,
+        pages: &[(usize, PAGE_PROTECTION_FLAGS)],
+        page_size: usize,
+    ) -> (Option<RestoreFailure>, usize) {
+        let mut first = None;
+        let mut additional = 0;
+        for &(page, previous) in pages.iter().rev() {
+            let mut ignored: PAGE_PROTECTION_FLAGS = 0;
+            // SAFETY: every entry was successfully protected by `write_code`,
+            // so `page` is page-aligned committed memory and `previous` is the
+            // exact protection the OS returned for it.
+            let succeeded = unsafe {
+                VirtualProtectEx(
+                    self.handle.as_handle(),
+                    page as *const c_void,
+                    page_size,
+                    previous,
+                    &mut ignored,
+                )
+            };
+            if succeeded == 0 {
+                let failure = RestoreFailure {
+                    address: page as u64,
+                    len: page_size,
+                    source: last_error(),
+                };
+                if first.is_none() {
+                    first = Some(failure);
+                } else {
+                    additional += 1;
+                }
+            }
+        }
+        (first, additional)
+    }
+
+    /// Verifies that every byte in `address..end` belongs to committed memory
+    /// before `write_code` changes any protection.
+    fn ensure_range_committed(&self, address: usize, end: usize) -> Result<(), CodeWriteError> {
+        let mut current = address;
+        while current < end {
+            // SAFETY: MEMORY_BASIC_INFORMATION is a plain-old-data Win32
+            // struct; all-zero is a valid initial value.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+            // SAFETY: the handle is valid and `info` is writable for the given
+            // size. `current` is a candidate user-mode address.
+            let written = unsafe {
+                VirtualQueryEx(
+                    self.handle.as_handle(),
+                    current as *const c_void,
+                    &mut info,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if written == 0 {
+                return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
+                    address: current as u64,
+                    len: end - current,
+                    source: last_error(),
+                }));
+            }
+            if info.State != MEM_COMMIT {
+                return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
+                    address: current as u64,
+                    len: end - current,
+                    source: Error::new(
+                        ErrorKind::InvalidAddress,
+                        None,
+                        format!("address {current:#x} is not committed memory"),
+                    ),
+                }));
+            }
+            let base = info.BaseAddress as usize;
+            let region_end = base.checked_add(info.RegionSize).ok_or_else(|| {
+                CodeWriteError::Failed(CodeWriteFailure::Protect {
+                    address: current as u64,
+                    len: end - current,
+                    source: Error::malformed("VirtualQueryEx returned a wrapping region"),
+                })
+            })?;
+            if base > current || region_end <= current {
+                return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
+                    address: current as u64,
+                    len: end - current,
+                    source: Error::malformed(
+                        "VirtualQueryEx returned a region that does not cover the queried address",
+                    ),
+                }));
+            }
+            current = region_end.min(end);
+        }
+        Ok(())
     }
 
     /// Returns whether the process is still running.
@@ -394,9 +615,12 @@ impl ProcessHandle {
 
     /// Changes the protection of a memory range.
     ///
-    /// Returns the previous protection of the first page in the range. Windows
-    /// reports only one protection value even when the range spans pages with
-    /// different protections.
+    /// Returns the previous protection of the **first page** in the range.
+    /// Windows reports only one protection value even when the range spans
+    /// pages with different protections, so the returned value is not enough to
+    /// restore a multi-page range. Use [`ProcessHandle::write_code`] for a
+    /// reversible code patch; it records the exact previous protection of every
+    /// page separately.
     ///
     /// # Errors
     ///
@@ -797,6 +1021,24 @@ fn invalid_address(address: u64, len: usize) -> Error {
         None,
         format!("address range {address:#x}..+{len} is not representable on this host"),
     )
+}
+
+fn system_page_size() -> Result<usize, CodeWriteError> {
+    // SAFETY: SYSTEM_INFO is a plain-old-data Win32 struct; all-zero is a valid
+    // initial value.
+    let mut info: SYSTEM_INFO = unsafe { zeroed() };
+    // SAFETY: GetSystemInfo writes a SYSTEM_INFO to the provided pointer and
+    // has no other preconditions.
+    unsafe { GetSystemInfo(&mut info) };
+    let page_size = info.dwPageSize as usize;
+    if page_size == 0 || !page_size.is_power_of_two() {
+        return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
+            address: 0,
+            len: 0,
+            source: Error::malformed("GetSystemInfo returned an invalid page size"),
+        }));
+    }
+    Ok(page_size)
 }
 
 fn page_to_protection(page: PAGE_PROTECTION_FLAGS) -> Protection {

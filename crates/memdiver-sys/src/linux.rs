@@ -24,8 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    Error, ErrorKind, PointerWidth, Protection, RawModule, RawProcessInfo, RawRegion, RegionKind,
-    io_message,
+    CodeWriteError, CodeWriteFailure, Error, ErrorKind, PointerWidth, Protection, RawModule,
+    RawProcessInfo, RawRegion, RegionKind, io_message,
 };
 
 const COMM: &CStr = c"comm";
@@ -200,6 +200,25 @@ impl ProcessHandle {
         pwrite(&self.mem, buffer, offset).map_err(io_error)
     }
 
+    /// Writes `buffer` at `address` and returns the number of bytes transferred.
+    ///
+    /// Linux does not allow one process to change another process's page
+    /// protections, and a write through `/proc/<pid>/mem` does not need a
+    /// protection change. This is therefore a plain [`ProcessHandle::write`];
+    /// the scoped code-write guarantees reduce to the normal write result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodeWriteError::Failed`] with [`CodeWriteFailure::Write`] for
+    /// any write error.
+    pub fn write_code(&self, address: u64, buffer: &[u8]) -> Result<usize, CodeWriteError> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        self.write(address, buffer)
+            .map_err(|source| CodeWriteError::Failed(CodeWriteFailure::Write(source)))
+    }
+
     /// Returns whether the process is still running.
     ///
     /// A zombie or dead process is reported as not alive, as is a process whose
@@ -296,7 +315,9 @@ impl ProcessHandle {
     ///
     /// Linux does not provide a way for one process to change another process's
     /// page protections. This method always returns
-    /// [`ErrorKind::Unsupported`].
+    /// [`ErrorKind::Unsupported`]. [`ProcessHandle::write_code`] remains
+    /// available because `/proc/<pid>/mem` writes do not need a protection
+    /// change.
     ///
     /// # Errors
     ///

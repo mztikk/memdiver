@@ -18,6 +18,11 @@ pub const MODULE_SIGNATURE: [u8; 16] = [
     0xDE, 0xAD, 0xBE, 0xEF, 0x6D, 0x65, 0x6D, 0x64, 0x69, 0x76, 0x65, 0x72, 0x21, 0x7F, 0x3C, 0x9A,
 ];
 
+/// Number of executable bytes returned by the fixture's `CODE` command.
+///
+/// Keep this in sync with `CODE_LEN` in `memdiver-fixture.rs`.
+pub const CODE_LEN: usize = 4;
+
 /// Returns `MODULE_SIGNATURE` formatted as a scanning pattern.
 pub fn module_signature_text() -> String {
     MODULE_SIGNATURE
@@ -140,6 +145,23 @@ impl Fixture {
     pub fn ping(&mut self) {
         self.request("PING");
         assert_eq!(self.response(), "PONG");
+    }
+
+    /// Returns the address and length of the fixture's executable code target.
+    ///
+    /// The bytes at this address are already what the parent is expected to
+    /// write back, so a failed protection restore does not alter the fixture's
+    /// behaviour.
+    pub fn code_target(&mut self) -> (Address, usize) {
+        self.request("CODE");
+        let response = self.response();
+        let fields: Vec<&str> = response.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "unexpected CODE response: {response:?}");
+        assert_eq!(fields[0], "CODE");
+        let address: u64 = fields[1].parse().expect("code target address");
+        let len: usize = fields[2].parse().expect("code target length");
+        assert_eq!(len, CODE_LEN);
+        (Address::new(address), len)
     }
 
     /// Kills and reaps the fixture process.

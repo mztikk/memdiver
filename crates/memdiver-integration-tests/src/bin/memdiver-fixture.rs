@@ -10,6 +10,7 @@
 //! * `READY <pid> <address> <length>` — first line written by the fixture.
 //! * `PING` → `PONG`
 //! * `PEEK <offset> <length>` → lowercase hexadecimal bytes
+//! * `CODE` → `CODE <address> <length>` for the executable code target
 //! * `EXIT` → the fixture exits
 //!
 //! Invalid commands or ranges produce `ERR`.
@@ -20,6 +21,22 @@ use std::io::{self, BufRead, Write};
 const BUFFER_LEN: usize = 4096;
 const MULTIPLIER: u8 = 37;
 const ADDEND: u8 = 11;
+
+/// Number of executable bytes exposed by the `CODE` command.
+///
+/// The parent writes these bytes back unchanged, so a failed protection
+/// restore cannot change the fixture's behaviour.
+const CODE_LEN: usize = 4;
+
+/// A never-called function whose entry point lives in the fixture image's
+/// executable section.
+///
+/// The parent patches its existing bytes back through `Process::write_code`;
+/// taking its address keeps it in the image.
+#[inline(never)]
+fn code_target() -> u64 {
+    std::hint::black_box(0x5EED_1234_ABCD_0001_u64)
+}
 
 /// Keep this byte-for-byte in sync with `MODULE_SIGNATURE` in the test harness.
 #[used]
@@ -47,6 +64,7 @@ fn main() -> io::Result<()> {
     std::hint::black_box(&MODULE_SIGNATURE);
 
     let buffer = pattern(BUFFER_LEN);
+    let code_address = code_target as *const () as usize;
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -65,6 +83,7 @@ fn main() -> io::Result<()> {
         let mut fields = line.split_whitespace();
         match fields.next() {
             Some("PING") => writeln!(output, "PONG")?,
+            Some("CODE") => writeln!(output, "CODE {code_address} {CODE_LEN}")?,
             Some("PEEK") => {
                 let offset = fields.next().and_then(|value| value.parse::<usize>().ok());
                 let len = fields.next().and_then(|value| value.parse::<usize>().ok());

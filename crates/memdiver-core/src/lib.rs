@@ -2,8 +2,9 @@
 //!
 //! `memdiver-core` is the implementation behind the [`memdiver`] façade. It
 //! exposes [`Process`], an owned handle that pins the target process, plus
-//! process discovery, typed reads and writes, memory-region and module queries,
-//! pattern scanning, pointer traversal, and bounded string reads.
+//! process discovery, typed reads and writes, scoped code writes that restore
+//! page protection, memory-region and module queries, pattern scanning, pointer
+//! traversal, and bounded string reads.
 //!
 //! # Platform support
 //!
@@ -13,6 +14,7 @@
 //! | Enumerate processes / open by name | `/proc` scan | Tool Help snapshot |
 //! | Read-only handles | read-only procfs descriptor | query/read rights only |
 //! | Read / write bytes | `pread` / `pwrite` on `/proc/<pid>/mem` | `ReadProcessMemory` / `WriteProcessMemory` |
+//! | Scoped code write | plain `/proc/<pid>/mem` write (no protection change) | per-page `VirtualProtectEx` + `WriteProcessMemory` + restore |
 //! | Typed values | yes | yes |
 //! | Memory regions | parsed from `/proc/<pid>/maps` | `VirtualQueryEx` |
 //! | Modules | executable file mappings from `/proc/<pid>/maps` | `EnumProcessModulesEx` |

@@ -3,9 +3,10 @@
 //! `memdiver` is a safe, production-oriented library for external process
 //! memory access. It pins the target process when you open it, discovers
 //! processes by name, performs positional reads and writes through
-//! operating-system primitives, scans memory for byte patterns, resolves
-//! pointer chains, and reports rich errors instead of panicking or silently
-//! truncating transfers.
+//! operating-system primitives, applies reversible code patches with temporary
+//! page-protection changes, scans memory for byte patterns, resolves pointer
+//! chains, and reports rich errors instead of panicking or silently truncating
+//! transfers.
 //!
 //! # Example
 //!
@@ -31,6 +32,7 @@
 //! | Open and pin a process | yes | yes |
 //! | Read-only handles | yes | yes |
 //! | Read / write bytes | yes | yes |
+//! | Scoped code write with protection restore | yes | yes |
 //! | Typed `Pod` read / write | yes | yes |
 //! | Enumerate memory regions | yes | yes |
 //! | Enumerate modules / module-at-address | yes | yes |

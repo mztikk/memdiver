@@ -61,8 +61,15 @@ touch code examples.
 * **Error context:** process, address, and length are present where relevant;
   the `OsError` source and raw code are preserved.
 * **Typed access:** only `Pod`; unaligned copies; zero-sized values handled.
-* **Read-only access:** write and protect paths reject `ProcessAccess::ReadOnly`
-  before touching the OS; zero-length writes remain no-ops.
+* **Read-only access:** write, write_code, and protect paths reject
+  `ProcessAccess::ReadOnly` before touching the OS; zero-length writes remain
+  no-ops.
+* **Scoped code writes:** `write_code` protects each page covering the range,
+  records raw per-page protection, restores every changed page on every exit
+  path, and reports both the write/protection failure and any restore failure.
+  It must never return success with a page still modified, and it must not rely
+  on `protect`'s first-page return for a multi-page range. Linux skips the
+  protection step and writes through `/proc/<pid>/mem`.
 * **Process discovery:** name matching uses platform case rules, ambiguous names
   return candidates, and the opened process is verified against its image name.
 * **Scanning:** chunks overlap by `pattern.len() - 1`, unreadable/guard regions
@@ -91,7 +98,9 @@ touch code examples.
   input.
 * Platform behaviour has a fixture-based test through the public API.
 * New error paths assert the structured variant and, where relevant, the source
-  error.
+  error. Composite scoped-write errors must retain both failures and their
+  address/range context; if a restore failure cannot be forced through the OS,
+  check for a focused unit test of its construction/formatting.
 * Platform-specific branches have a test or a documented reason why they can
   only run in CI.
 * Run the release profile once when touching concurrency or overflow-sensitive

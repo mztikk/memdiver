@@ -21,6 +21,7 @@ exe_path() -> Result<Option<PathBuf>>
 pointer_width() -> Result<PointerWidth>
 read(address: u64, &mut [u8]) -> Result<usize>
 write(address: u64, &[u8]) -> Result<usize>
+write_code(address: u64, &[u8]) -> Result<usize, CodeWriteError>
 is_alive() -> bool
 wait_for_exit(timeout: Option<Duration>) -> Result<bool>
 regions() -> Result<Vec<RawRegion>>
@@ -39,8 +40,11 @@ chains, and string framing; the sys layer returns raw facts only.
 
 Reads and writes return the actual transfer count; the safe layer decides that
 a short transfer is `PartialRead`/`PartialWrite`. Never hide a short transfer
-inside the sys layer. Every error must be `memdiver_sys::Error` with an
-`ErrorKind` and the raw OS code where one exists.
+inside the sys layer. `write_code` returns a transfer count on success and a
+`CodeWriteError` that keeps the write/protection failure and the restoration
+failure separately; the safe layer turns that into the user-facing composite
+error. Every error must be `memdiver_sys::Error` with an `ErrorKind` and the raw
+OS code where one exists, except for the structured scoped-write outcome.
 
 The pinned-instance invariants are not negotiable:
 
@@ -69,7 +73,9 @@ The pinned-instance invariants are not negotiable:
    and every malformed-input path you can construct without a live process.
 5. **Add the safe wrapper** in `memdiver-core`: validate the range, add process /
    address / length context, map special `ErrorKind`s (`Unsupported`,
-   `InvalidProtection`), and keep the OS error as `source`.
+   `InvalidProtection`), and keep the OS error as `source`. If an operation can
+   fail in more than one step, keep each failure instead of flattening them; see
+   the `write_code` composite errors.
 6. **Add an integration test** through `memdiver` using the fixture. If the
    operation is platform-specific, add the platform-gated test and ensure the
    other platform covers the `Unsupported` case. Use the
@@ -110,7 +116,8 @@ The pinned-instance invariants are not negotiable:
   10 ms procfs liveness polling only when `pidfd_open` is unavailable or denied.
   Verify the pidfd against the captured start time before trusting it.
 * Linux cannot change another process's protection: return
-  `ErrorKind::Unsupported`.
+  `ErrorKind::Unsupported`. `write_code` is still supported and is a plain
+  `write` through `/proc/<pid>/mem`; no protection step is needed or possible.
 
 ### Windows
 
@@ -127,7 +134,16 @@ The pinned-instance invariants are not negotiable:
 * `VirtualProtectEx` cannot represent write-only pages, or executable pages
   that are writable without being readable. Return `InvalidProtection` instead
   of widening access. Execute-only is `PAGE_EXECUTE`. The old protection is for
-  the first page of a multi-page range.
+  the first page of a multi-page range only; pages in one range can differ. Use
+  `write_code` rather than a single protect/reprotect pair when a range must be
+  restored.
+* `write_code` protects every page covering the request individually with
+  `PAGE_EXECUTE_READWRITE`, stores the exact raw `PAGE_PROTECTION_FLAGS` returned
+  for that page, writes, and restores each page with the same raw value on every
+  path. Raw flags matter: a `Protection` round trip can turn
+  `PAGE_EXECUTE_WRITECOPY` into `PAGE_EXECUTE_READWRITE`. Restore all changed
+  pages even when one restore fails, and preflight the committed range before
+  changing anything. Use `GetSystemInfo().dwPageSize` rather than assuming 4 KiB.
 * `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` is the liveness check. Do not
   use `GetExitCodeProcess == STILL_ACTIVE`; the exit code is ambiguous.
 * `wait_for_exit` uses `WaitForSingleObject` with millisecond timeouts. `None`

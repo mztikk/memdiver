@@ -5,7 +5,10 @@ use std::mem::size_of;
 
 use bytemuck::Pod;
 use memdiver_sys::ErrorKind as OsErrorKind;
-use memdiver_sys::{ProcessHandle, processes as platform_processes};
+use memdiver_sys::{
+    CodeWriteError, CodeWriteFailure, ProcessHandle, RestoreFailure,
+    processes as platform_processes,
+};
 
 use crate::error::open_error;
 use crate::process_info::name_matches;
@@ -317,7 +320,10 @@ impl Process {
 
     /// Writes `buffer` to `address` in the target process.
     ///
-    /// A zero-length write is a no-op and does not access the target.
+    /// A zero-length write is a no-op and does not access the target. On
+    /// Windows, writing to an executable, non-writable code page fails; use
+    /// [`Process::write_code`] for reversible code patches, which temporarily
+    /// raises page protection and restores it.
     ///
     /// # Errors
     ///
@@ -347,6 +353,138 @@ impl Process {
                     source,
                 })?;
         ensure_complete_write(self.pid, address, buffer.len(), transferred)
+    }
+
+    /// Writes `buffer` to `address` as a scoped code write.
+    ///
+    /// This is the supported helper for reversible code patching. On Linux it
+    /// is equivalent to [`Process::write`]: writes through `/proc/<pid>/mem`
+    /// do not need a protection change. On Windows every page covering the
+    /// range is temporarily changed to `PAGE_EXECUTE_READWRITE`, the bytes are
+    /// written, and each page's exact original protection is restored on every
+    /// exit path. Protection is captured and restored page by page, so a
+    /// multi-page range with differing protections is handled correctly; do
+    /// not hand-roll [`Process::protect`] + write + restore for code patches.
+    ///
+    /// A zero-length write is a no-op and does not access the target. A handle
+    /// opened with [`ProcessAccess::ReadOnly`] rejects a non-empty write with
+    /// [`Error::ReadOnly`] before any operating-system call.
+    ///
+    /// A failed or partial write can still have modified the target; the
+    /// helper restores protection but cannot undo the bytes that were already
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadOnly`] for a non-empty write through a read-only
+    /// handle, [`Error::AddressRange`] when the range overflows, and
+    /// [`Error::Write`] or [`Error::PartialWrite`] when the write itself fails
+    /// and all changed protections were restored. Returns [`Error::Protect`]
+    /// when the range is not fully committed or changing a page's protection
+    /// fails and the pages already changed were restored, and
+    /// [`Error::Unsupported`] when the platform cannot change protections.
+    ///
+    /// If restoring a page also fails, returns [`Error::CodeWrite`] with both
+    /// the write/protection failure and the restore failure, or
+    /// [`Error::CodeWriteRestore`] when the write succeeded but restoration
+    /// failed.
+    pub fn write_code(&self, address: Address, buffer: &[u8]) -> Result<()> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        if !self.is_writable() {
+            return Err(Error::ReadOnly {
+                pid: self.pid,
+                operation: "Process::write_code",
+            });
+        }
+        validate_range(address, buffer.len())?;
+        let len = buffer.len();
+        match self.inner.write_code(address.get(), buffer) {
+            Ok(transferred) => ensure_complete_write(self.pid, address, len, transferred),
+            Err(CodeWriteError::Failed(failure)) => {
+                Err(self.code_write_failure(address, len, failure))
+            }
+            Err(CodeWriteError::RestoreFailedAfterWrite {
+                transferred,
+                restore,
+                additional_restore_failures,
+            }) => {
+                let restore = Box::new(self.code_write_restore(restore));
+                if transferred != len {
+                    Err(Error::CodeWrite {
+                        pid: self.pid,
+                        address,
+                        len,
+                        failure: Box::new(Error::PartialWrite {
+                            pid: self.pid,
+                            address,
+                            requested: len,
+                            transferred,
+                        }),
+                        restore,
+                        additional_restore_failures,
+                    })
+                } else {
+                    Err(Error::CodeWriteRestore {
+                        pid: self.pid,
+                        address,
+                        len,
+                        transferred,
+                        restore,
+                        additional_restore_failures,
+                    })
+                }
+            }
+            Err(CodeWriteError::RestoreFailedAfterFailure {
+                failure,
+                restore,
+                additional_restore_failures,
+            }) => Err(Error::CodeWrite {
+                pid: self.pid,
+                address,
+                len,
+                failure: Box::new(self.code_write_failure(address, len, failure)),
+                restore: Box::new(self.code_write_restore(restore)),
+                additional_restore_failures,
+            }),
+        }
+    }
+
+    fn code_write_failure(&self, address: Address, len: usize, failure: CodeWriteFailure) -> Error {
+        match failure {
+            CodeWriteFailure::Protect {
+                address: page,
+                len: page_len,
+                source,
+            } => match source.kind() {
+                OsErrorKind::Unsupported => Error::Unsupported {
+                    operation: "Process::write_code",
+                    reason: "the platform does not allow one process to change another process's page protections",
+                },
+                _ => Error::Protect {
+                    pid: self.pid,
+                    address: Address::new(page),
+                    len: page_len,
+                    source,
+                },
+            },
+            CodeWriteFailure::Write(source) => Error::Write {
+                pid: self.pid,
+                address,
+                len,
+                source,
+            },
+        }
+    }
+
+    fn code_write_restore(&self, restore: RestoreFailure) -> Error {
+        Error::Protect {
+            pid: self.pid,
+            address: Address::new(restore.address),
+            len: restore.len,
+            source: restore.source,
+        }
     }
 
     /// Reads a plain-old-data value from `address`.
@@ -488,12 +626,18 @@ impl Process {
     }
 
     /// Changes the protection of `len` bytes starting at `address`, returning
-    /// the previous protection.
+    /// the previous protection of the **first page** in the range.
     ///
-    /// On Windows the previous protection is the value reported for the first
-    /// page of the range. Linux does not allow one process to change another
-    /// process's page protections; on Linux this returns
-    /// [`Error::Unsupported`].
+    /// A range can span pages with different protections, but Windows reports
+    /// only one previous protection value. Restoring with that single value can
+    /// silently change the protection of the remaining pages. Use
+    /// [`Process::write_code`] for a reversible code patch instead of
+    /// hand-rolling protect + write + restore; it captures and restores
+    /// protection page by page and reports a composite error when restoration
+    /// fails.
+    ///
+    /// Linux does not allow one process to change another process's page
+    /// protections; on Linux this returns [`Error::Unsupported`].
     ///
     /// # Errors
     ///

@@ -288,6 +288,56 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// A scoped code write failed and the original page protection could not
+    /// be fully restored.
+    ///
+    /// This combines the protection or write failure with the failure to
+    /// restore the first page whose protection was left modified. Use
+    /// [`Error::CodeWriteRestore`] when the write itself succeeded but
+    /// restoration failed.
+    #[error(
+        "failed to write {len} bytes of code at {address} in process {pid}: {failure}; restoring the original protection also failed: {restore} ({additional_restore_failures} additional page restoration failure(s))"
+    )]
+    CodeWrite {
+        /// PID of the target process.
+        pid: u32,
+        /// Start of the code range.
+        address: Address,
+        /// Number of bytes requested.
+        len: usize,
+        /// Failure from the write or protection step.
+        #[source]
+        failure: Box<Error>,
+        /// Failure restoring the first page that could not be restored.
+        restore: Box<Error>,
+        /// Number of further pages whose protection could not be restored.
+        additional_restore_failures: usize,
+    },
+
+    /// A scoped code write completed, but the original page protection could
+    /// not be fully restored.
+    ///
+    /// The write transferred the bytes successfully; the only failure is the
+    /// attempted restoration of a page's previous protection.
+    #[error(
+        "wrote {transferred} of {len} bytes of code at {address} in process {pid}, but restoring the original protection failed: {restore} ({additional_restore_failures} additional page restoration failure(s))"
+    )]
+    CodeWriteRestore {
+        /// PID of the target process.
+        pid: u32,
+        /// Start of the code range.
+        address: Address,
+        /// Number of bytes requested.
+        len: usize,
+        /// Number of bytes actually written.
+        transferred: usize,
+        /// Failure restoring the first page that could not be restored.
+        #[source]
+        restore: Box<Error>,
+        /// Number of further pages whose protection could not be restored.
+        additional_restore_failures: usize,
+    },
+
     /// A pointer chain overflowed the target's address width.
     #[error("pointer chain overflow at {address} while adding {offset:#x} in process {pid}")]
     PointerChainOverflow {
@@ -378,5 +428,63 @@ mod tests {
             source,
         };
         assert!(error.to_string().contains("read buffer"));
+    }
+
+    #[test]
+    fn code_write_error_keeps_both_failures_and_context() {
+        let address = Address::new(0x1000);
+        let write = Error::PartialWrite {
+            pid: 42,
+            address,
+            requested: 16,
+            transferred: 8,
+        };
+        // The production restore failure is `Error::Protect`, but building that
+        // variant needs an `OsError` from an operating-system call. This unit
+        // test focuses on composition and formatting, so a structural error
+        // with a page address stands in for the restore failure.
+        let restore = Error::AddressRange {
+            address: Address::new(0x2000),
+            len: 0x1000,
+        };
+        let error = Error::CodeWrite {
+            pid: 42,
+            address,
+            len: 16,
+            failure: Box::new(write),
+            restore: Box::new(restore),
+            additional_restore_failures: 2,
+        };
+        let message = error.to_string();
+        assert!(message.contains("process 42"), "{message}");
+        assert!(message.contains("0x1000"), "{message}");
+        assert!(message.contains("8 of 16"), "{message}");
+        assert!(message.contains("0x2000"), "{message}");
+        assert!(message.contains("2 additional"), "{message}");
+        let source = std::error::Error::source(&error).expect("write failure must be the source");
+        assert!(source.to_string().contains("8 of 16"), "{source}");
+
+        // A restore failure after a successful write is a distinct variant so
+        // callers can tell that the bytes were transferred and only protection
+        // is at risk. The OS has no reliable way to force VirtualProtectEx to
+        // fail only during restoration, so the composite construction and
+        // formatting is covered here rather than in an end-to-end test.
+        let restore = Error::AddressRange {
+            address: Address::new(0x3000),
+            len: 0x1000,
+        };
+        let error = Error::CodeWriteRestore {
+            pid: 42,
+            address,
+            len: 16,
+            transferred: 16,
+            restore: Box::new(restore),
+            additional_restore_failures: 0,
+        };
+        let message = error.to_string();
+        assert!(message.contains("wrote 16 of 16"), "{message}");
+        assert!(message.contains("0x3000"), "{message}");
+        let source = std::error::Error::source(&error).expect("restore failure must be the source");
+        assert!(source.to_string().contains("0x3000"), "{source}");
     }
 }

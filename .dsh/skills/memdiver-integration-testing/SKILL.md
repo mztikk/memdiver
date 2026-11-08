@@ -16,6 +16,7 @@ crates/memdiver-integration-tests/
   src/bin/memdiver-fixture.rs   deterministic child process + module signature
   tests/common/mod.rs           handshake, fixture, signature constant
   tests/read_write.rs           bytes, typed values, errors, concurrency
+  tests/write_code.rs           scoped code writes, read-only rejection, protection restore
   tests/queries.rs              regions, modules, protection, module_at
   tests/process_selection.rs    process list, by-name open, read-only access
   tests/scanning.rs             module/heap scans, wildcards, alignment, limits
@@ -44,6 +45,7 @@ Then it reads one command per line and writes one response line:
 |---------|----------|
 | `PING` | `PONG` |
 | `PEEK <offset> <length>` | lowercase hex bytes |
+| `CODE` | `CODE <address> <length>` for the executable code target |
 | `EXIT` | exits |
 
 Invalid commands or ranges produce `ERR`. The child is blocked on stdin while
@@ -58,6 +60,12 @@ The fixture executable also contains `MODULE_SIGNATURE`, a fixed 16-byte
 sequence in read-only data. `common::module_signature_text()` formats it as a
 scan pattern. Keep the fixture and `common` constants byte-identical; module
 scans rely on it being in an image section.
+
+`CODE` exposes `code_target`, a never-called function in the executable image,
+plus `CODE_LEN` (currently 4). The parent must only write the function's existing
+bytes back through `write_code`; patching different instruction bytes risks
+crashing the fixture if a protection restore ever fails. `common::CODE_LEN` must
+stay in sync with the fixture.
 
 ## Writing a test
 
@@ -80,7 +88,19 @@ scans rely on it being in an image section.
   spawn fixtures concurrently. Use the test executable's unique name for a
   successful `open_by_name` test, and two fixtures for an ambiguity test.
 * Read-only tests must read successfully and assert `Error::ReadOnly` for
-  `write`, `write_value`, and `protect`.
+  `write`, `write_code`, `write_value`, and `protect`. Zero-length writes,
+  including `write_code`, remain no-ops.
+* `write_code` tests cover the fixture heap, zero-length no-ops, read-only
+  rejection, and overflowing ranges. The Windows test uses `fixture.code_target()`
+  to confirm the address is executable and non-writable, writes its existing
+  bytes with `write_code`, and asserts the region's protection is identical
+  afterwards. Do not rely on a plain `write` failing on that page: Wine and other
+  compatibility layers may not enforce the page protection for
+  `WriteProcessMemory`, so the `VirtualQueryEx`-reported protection is the
+  authoritative check in the test.
+* Composite restore-error construction cannot be forced reliably through the OS;
+  cover its formatting and source chain with a unit test in `memdiver-core` and
+  document why.
 * Scan tests need a module-resident signature (`MODULE_SIGNATURE`), a heap-only
   signature that `find_pattern` must not return, wildcard/nibble cases,
   alignment, result limits, and a unit test for a match spanning the scan-chunk
@@ -112,6 +132,10 @@ cargo test -p memdiver-integration-tests --all-targets
 cargo test -p memdiver-integration-tests --test read_write -- --nocapture
 cargo test --workspace --all-targets
 cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+# Optional local Windows execution when Wine is installed:
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine \
+  WINEPREFIX=$PWD/.wine-test \
+  cargo test -p memdiver-integration-tests --test write_code --target x86_64-pc-windows-gnu
 ```
 
 If a fixture test fails before any assertion:
@@ -133,5 +157,7 @@ If a fixture test fails before any assertion:
 
 The full sequence before committing is in the `memdiver-review-gate` skill. At
 minimum, run the host test suite, clippy for the host and Windows target, and
-the Windows cross-check. Windows-only tests are executed by CI; compile them
-locally with `--all-targets` so type errors and lint violations do not reach CI.
+the Windows cross-check. Windows-only tests can be exercised locally under Wine
+as a debugging aid; that is not a replacement for native Windows CI. Compile
+them locally with `--all-targets` so type errors and lint violations do not
+reach CI.

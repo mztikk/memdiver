@@ -7,6 +7,9 @@
 //! * [`ProcessHandle`] pins one process and its memory for its entire lifetime.
 //! * Reads and writes report how many bytes the operating system transferred;
 //!   deciding whether a short transfer is an error is the caller's job.
+//! * [`ProcessHandle::write_code`] performs a scoped code write that temporarily
+//!   changes page protection and reports write and restoration failures
+//!   separately.
 //! * Errors are reported as [`Error`] values carrying an [`ErrorKind`] and the
 //!   raw operating-system error code. No platform error is flattened into a
 //!   string without keeping the code around.
@@ -225,6 +228,71 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// A page whose original protection could not be restored after a scoped code
+/// write.
+#[derive(Debug)]
+pub struct RestoreFailure {
+    /// Address of the page whose protection could not be restored.
+    pub address: u64,
+    /// Number of bytes covered by the failed restoration.
+    pub len: usize,
+    /// Operating-system error from restoring the protection.
+    pub source: Error,
+}
+
+/// The step of a scoped code write that failed.
+///
+/// A [`CodeWriteFailure::Protect`] failure names the page whose protection
+/// could not be changed; a [`CodeWriteFailure::Write`] failure covers the whole
+/// requested range.
+#[derive(Debug)]
+pub enum CodeWriteFailure {
+    /// Changing the protection of one page failed.
+    Protect {
+        /// Address of the page whose protection change failed.
+        address: u64,
+        /// Number of bytes covered by the failed protection change.
+        len: usize,
+        /// Operating-system error from the protection change.
+        source: Error,
+    },
+    /// Writing the bytes failed.
+    Write(Error),
+}
+
+/// The result of a failed [`ProcessHandle::write_code`] call.
+///
+/// The variants separate the two interesting outcomes: either every protection
+/// touched by the operation was restored, or at least one page was left with
+/// the temporary protection. A write or protection failure is retained
+/// alongside the restore failure so callers can report both.
+#[derive(Debug)]
+pub enum CodeWriteError {
+    /// The write or a protection change failed and every protection that had
+    /// already been changed was restored successfully.
+    Failed(CodeWriteFailure),
+    /// The write succeeded, but at least one page's original protection could
+    /// not be restored.
+    RestoreFailedAfterWrite {
+        /// Number of bytes the operating system reported as written.
+        transferred: usize,
+        /// The first page whose protection could not be restored.
+        restore: RestoreFailure,
+        /// Number of further pages whose protection could not be restored.
+        additional_restore_failures: usize,
+    },
+    /// The write or a protection change failed and at least one page's original
+    /// protection could not be restored.
+    RestoreFailedAfterFailure {
+        /// Failure from the protection or write step.
+        failure: CodeWriteFailure,
+        /// The first page whose protection could not be restored.
+        restore: RestoreFailure,
+        /// Number of further pages whose protection could not be restored.
+        additional_restore_failures: usize,
+    },
+}
 
 /// A committed memory region as reported by the operating system.
 #[derive(Clone, Debug, PartialEq, Eq)]
