@@ -51,7 +51,7 @@
 //! # }
 //! ```
 //!
-//! [`memdiver`]: https://github.com/mztikk/external-memory-dsh/tree/main/crates/memdiver
+//! [`memdiver`]: https://github.com/mztikk/memdiver/tree/main/crates/memdiver
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]

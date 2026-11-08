@@ -21,8 +21,8 @@
 //! Linux and Windows are supported. Other targets fail to compile with an
 //! explicit error instead of silently pretending memory access is available.
 //!
-//! [`memdiver`]: https://github.com/mztikk/external-memory-dsh/tree/main/crates/memdiver
-//! [`memdiver-core`]: https://github.com/mztikk/external-memory-dsh/tree/main/crates/memdiver-core
+//! [`memdiver`]: https://github.com/mztikk/memdiver/tree/main/crates/memdiver
+//! [`memdiver-core`]: https://github.com/mztikk/memdiver/tree/main/crates/memdiver-core
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

@@ -1,6 +1,5 @@
 # memdiver
 
-[![CI](https://github.com/mztikk/external-memory-dsh/actions/workflows/ci.yml/badge.svg)](https://github.com/mztikk/external-memory-dsh/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](#toolchain)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -89,7 +88,7 @@ the repository directly:
 
 ```toml
 [dependencies]
-memdiver = { git = "https://github.com/mztikk/external-memory-dsh" }
+memdiver = { git = "https://github.com/mztikk/memdiver" }
 ```
 
 The intended crates.io names are `memdiver`, `memdiver-core`, and

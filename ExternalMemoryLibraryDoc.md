@@ -10,7 +10,7 @@ We're building a production-grade Library to read and write memory of an externa
 - Create AGENTS.md and relevant skills to support development, and contain concrete development guidelines
 - idiomatic rust
 - standards
-- Commit and push to [repo](https://github.com/mztikk/external-memory-dsh) . IMPORTANT: do a Code Review before every commit and make sure all changes comply with code style, production-grade quality standards and everything has been tested and has unit tests that have passed where necessary
+- Commit and push to [repo](https://github.com/mztikk/memdiver) . IMPORTANT: do a Code Review before every commit and make sure all changes comply with code style, production-grade quality standards and everything has been tested and has unit tests that have passed where necessary
 
 ## Tech stack
 - Rust

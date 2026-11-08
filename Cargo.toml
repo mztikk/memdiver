@@ -8,8 +8,8 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Nils Feierabend <mztikk@outlook.de>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mztikk/external-memory-dsh"
-homepage = "https://github.com/mztikk/external-memory-dsh"
+repository = "https://github.com/mztikk/memdiver"
+homepage = "https://github.com/mztikk/memdiver"
 keywords = ["memory", "process", "windows", "linux", "debugging"]
 categories = ["os", "api-bindings", "development-tools::debugging"]
 
