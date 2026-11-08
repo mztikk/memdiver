@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Nils Feierabend <mztikk@outlook.de>"]
@@ -38,9 +38,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
-memdiver-core = { path = "crates/memdiver-core", version = "0.1.1" }
-memdiver-sys = { path = "crates/memdiver-sys", version = "0.1.1" }
-memdiver = { path = "crates/memdiver", version = "0.1.1" }
+memdiver-core = { path = "crates/memdiver-core", version = "0.2.0" }
+memdiver-sys = { path = "crates/memdiver-sys", version = "0.2.0" }
+memdiver = { path = "crates/memdiver", version = "0.2.0" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
