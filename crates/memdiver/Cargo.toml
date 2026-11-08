@@ -1,0 +1,19 @@
+[package]
+name = "memdiver"
+description = "Read and write the memory of another process on Linux and Windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+memdiver-core.workspace = true
+
+[lints]
+workspace = true

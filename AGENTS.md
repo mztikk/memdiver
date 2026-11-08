@@ -4,7 +4,7 @@ Operational guide for anyone — human or agent — changing this repository.
 
 ## Mission
 
-`memoria` is a production-grade Rust library that reads and writes another
+`memdiver` is a production-grade Rust library that reads and writes another
 process's memory on Linux and Windows. Correctness, predictable failure modes,
 and auditability matter more than feature breadth. A change is not finished
 until it is formatted, lint-clean, tested on Linux, type-checked (and ideally
@@ -34,24 +34,24 @@ Never merge or commit:
 ## Architecture
 
 ```text
-memoria (façade, examples)  ->  memoria-core (safe API)  ->  memoria-sys (OS)
-memoria-integration-tests   ->  memoria (public API only)
+memdiver (façade, examples)  ->  memdiver-core (safe API)  ->  memdiver-sys (OS)
+memdiver-integration-tests   ->  memdiver (public API only)
 ```
 
 Dependency direction is strictly one-way.
 
-* `crates/memoria-sys` owns every OS mechanism: file descriptors, Win32 handles,
+* `crates/memdiver-sys` owns every OS mechanism: file descriptors, Win32 handles,
   procfs parsing, memory APIs, module enumeration. It defines no polished
   end-user ergonomics and does no type reinterpretation for callers.
-* `crates/memoria-core` owns the safe API: `Address`, `Process`, `Error`,
+* `crates/memdiver-core` owns the safe API: `Address`, `Process`, `Error`,
   `Region`, `Module`, typed I/O. It must not contain platform FFI.
-* `crates/memoria` re-exports the public API and holds user-facing
+* `crates/memdiver` re-exports the public API and holds user-facing
   documentation and examples.
-* `crates/memoria-integration-tests` contains the fixture binary and tests that
-  use only the public API. The fixture must never import `memoria` internals.
+* `crates/memdiver-integration-tests` contains the fixture binary and tests that
+  use only the public API. The fixture must never import `memdiver` internals.
 
-Adding platform code to `memoria` or `memoria-core`, or policy (name matching,
-error context, allocation decisions) to `memoria-sys`, is an architecture bug.
+Adding platform code to `memdiver` or `memdiver-core`, or policy (name matching,
+error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
 
 ## Non-negotiable invariants
 
@@ -87,8 +87,8 @@ error context, allocation decisions) to `memoria-sys`, is an architecture bug.
 
 ## Unsafe code policy
 
-`memoria` and `memoria-core` are `#![forbid(unsafe_code)]`. All `unsafe` lives
-in `memoria-sys`.
+`memdiver` and `memdiver-core` are `#![forbid(unsafe_code)]`. All `unsafe` lives
+in `memdiver-sys`.
 
 * Every `unsafe` block starts with a `// SAFETY:` comment naming the invariant
   that makes it sound.
@@ -169,8 +169,8 @@ Tests live at the lowest level that can observe the behaviour:
   tests next to the code, including boundary and malformed-input cases.
 * **Platform behaviour** (open, read, write, typed I/O, regions, modules,
   protection, liveness) gets end-to-end tests in
-  `crates/memoria-integration-tests` against the fixture child.
-* Tests must use the public API from `memoria`, not `memoria-sys` internals.
+  `crates/memdiver-integration-tests` against the fixture child.
+* Tests must use the public API from `memdiver`, not `memdiver-sys` internals.
 * Tests must be deterministic and must not depend on enumeration order. Assert
   membership and sortedness, not exact whole-list contents.
 * Use the fixture harness in `tests/common/mod.rs` instead of hand-rolling a
@@ -188,11 +188,11 @@ Tests live at the lowest level that can observe the behaviour:
 
 When adding a public operation, add:
 
-1. the `memoria-sys` implementation for both platforms (or an explicit
+1. the `memdiver-sys` implementation for both platforms (or an explicit
    `Unsupported` error with a test),
 2. the safe wrapper with docs and error context,
 3. unit tests for pure edge cases,
-4. an integration test through `memoria`,
+4. an integration test through `memdiver`,
 5. a row update in the README feature matrix,
 6. a Windows cross-check/clippy run.
 
@@ -224,11 +224,12 @@ Do this deliberately; do not skip it because the diff is small.
   state that in the commit body and rely on CI.
 * Version bumps follow SemVer. Error enum additions are non-exhaustive and may
   be minor. Removing or renaming public items is a breaking change.
-* The crates.io name `memoria` is currently owned by an unrelated crate. Do not
-  publish the façade under this name without a rename or ownership transfer;
-  the README intentionally documents a Git dependency instead.
+* The façade is intended to be published as `memdiver`, with `memdiver-core`
+  and `memdiver-sys`. Verify that all three names are still available before the
+  first release and publish in dependency order: sys, core, then façade.
 * Before publishing, run `cargo package --list -p <crate>` and check that the
-  package contains the README, license metadata, and no fixture/test-only code.
+  package contains the README, license files, license metadata, and no
+  fixture/test-only code.
 
 ## Toolchain
 

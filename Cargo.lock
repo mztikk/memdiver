@@ -21,30 +21,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
-name = "memoria"
+name = "memdiver"
 version = "0.1.0"
 dependencies = [
- "memoria-core",
+ "memdiver-core",
 ]
 
 [[package]]
-name = "memoria-core"
+name = "memdiver-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "memoria-sys",
+ "memdiver-sys",
  "thiserror",
 ]
 
 [[package]]
-name = "memoria-integration-tests"
+name = "memdiver-integration-tests"
 version = "0.1.0"
 dependencies = [
- "memoria",
+ "memdiver",
 ]
 
 [[package]]
-name = "memoria-sys"
+name = "memdiver-sys"
 version = "0.1.0"
 dependencies = [
  "bitflags",

@@ -26,9 +26,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
-memoria-core = { path = "crates/memoria-core", version = "0.1.0" }
-memoria-sys = { path = "crates/memoria-sys", version = "0.1.0" }
-memoria = { path = "crates/memoria", version = "0.1.0" }
+memdiver-core = { path = "crates/memdiver-core", version = "0.1.0" }
+memdiver-sys = { path = "crates/memdiver-sys", version = "0.1.0" }
+memdiver = { path = "crates/memdiver", version = "0.1.0" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

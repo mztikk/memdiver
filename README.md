@@ -1,10 +1,10 @@
-# memoria
+# memdiver
 
 [![CI](https://github.com/mztikk/external-memory-dsh/actions/workflows/ci.yml/badge.svg)](https://github.com/mztikk/external-memory-dsh/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](#toolchain)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-`memoria` is a production-grade Rust library for reading and writing the memory
+`memdiver` is a production-grade Rust library for reading and writing the memory
 of another process on Linux and Windows.
 
 It is built around a small set of guarantees that matter in real deployments:
@@ -50,35 +50,32 @@ or real cross-process integration tests.
   patterns can be constructed from arbitrary memory.
 * **No panics on untrusted input.** Bad addresses, integer overflow, malformed
   procfs data, and permission failures are returned as errors.
-* **Narrow unsafe surface.** `memoria` and `memoria-core` forbid `unsafe` code.
-  All FFI and platform-specific logic lives in `memoria-sys`, with every
+* **Narrow unsafe surface.** `memdiver` and `memdiver-core` forbid `unsafe` code.
+  All FFI and platform-specific logic lives in `memdiver-sys`, with every
   `unsafe` block carrying a `SAFETY` justification.
 
 ## Installation
 
-This workspace is not published on crates.io. The crates.io name `memoria` is
-currently held by an unrelated 0.1.0 crate, so the installation snippet uses the
-repository directly:
+The crate has not been published to crates.io yet. Until the first release, use
+the repository directly:
 
 ```toml
 [dependencies]
-memoria = { git = "https://github.com/mztikk/external-memory-dsh" }
+memdiver = { git = "https://github.com/mztikk/external-memory-dsh" }
 ```
 
-Use a `path` dependency when working inside the workspace. Publishing the
-façade will require a new crate name (or ownership of the existing one); the
-crate names in this repository are kept as `memoria`, `memoria-core`, and
-`memoria-sys`.
+The intended crates.io names are `memdiver`, `memdiver-core`, and
+`memdiver-sys`. Use a `path` dependency when working inside the workspace.
 
-The crate is a façade over `memoria-core`, which in turn uses the low-level
-`memoria-sys` bindings. Most users only need `memoria`.
+The crate is a façade over `memdiver-core`, which in turn uses the low-level
+`memdiver-sys` bindings. Most users only need `memdiver`.
 
 ## Quick start
 
 ```rust
-use memoria::{Address, Process};
+use memdiver::{Address, Process};
 
-fn main() -> Result<(), memoria::Error> {
+fn main() -> Result<(), memdiver::Error> {
     // Open any process you are allowed to inspect.
     let process = Process::open(1234)?;
 
@@ -112,9 +109,9 @@ fn main() -> Result<(), memoria::Error> {
 Reading a value out of your own process is a self-contained way to try the API:
 
 ```rust
-use memoria::{Address, Process};
+use memdiver::{Address, Process};
 
-fn main() -> Result<(), memoria::Error> {
+fn main() -> Result<(), memdiver::Error> {
     let process = Process::open(std::process::id())?;
     let magic = std::hint::black_box(0xDEAD_BEEFu32);
     let address = Address::new((&magic as *const u32) as u64);
@@ -143,15 +140,15 @@ fn main() -> Result<(), memoria::Error> {
 | `Protection` | Read / write / execute / guard flags. |
 | `Region`, `Module` | Snapshots with base, size, bounds checks, and metadata. |
 
-All fallible operations return `memoria::Result<T>`, an alias for
-`Result<T, memoria::Error>`.
+All fallible operations return `memdiver::Result<T>`, an alias for
+`Result<T, memdiver::Error>`.
 
 ### Errors
 
 `Error` is non-exhaustive and keeps structured context:
 
 ```rust
-use memoria::{Error, Process};
+use memdiver::{Error, Process};
 
 match Process::open(1234) {
     Ok(process) => { /* ... */ }
@@ -166,7 +163,7 @@ match Process::open(1234) {
 Transfers are all-or-nothing from the API's perspective. A short OS transfer is
 an error, even though the caller's buffer may contain the bytes that were
 transferred before the failure. On Windows the OS can copy a partial buffer and
-then fail the call; `memoria` reports a write/read error in that case and does
+then fail the call; `memdiver` reports a write/read error in that case and does
 not claim success.
 
 ## Platform details
@@ -256,7 +253,7 @@ required.
 * The library never attaches a debugger, suspends threads, or injects code.
 * On a 32-bit Windows build, addresses above `usize::MAX` cannot be passed to
   the Win32 APIs, and module enumeration is subject to the OS's 32/64-bit
-  limitations. Build `memoria` for the target's bitness when full access is
+  limitations. Build `memdiver` for the target's bitness when full access is
   required.
 
 ## Development
@@ -267,7 +264,7 @@ just ci              # check + Windows cross-check/clippy
 just example         # run the inspection example
 ```
 
-The end-to-end suite starts a real child process (`memoria-fixture`), reads and
+The end-to-end suite starts a real child process (`memdiver-fixture`), reads and
 writes its heap buffer through the public API, and verifies the results from the
 child's point of view. It also exercises regions, modules, protection changes
 (Windows), liveness, PID-reuse safety, errors, and concurrent access.
@@ -279,15 +276,15 @@ skills under [`.dsh/skills`](.dsh/skills) for the development rules.
 ### Workspace layout
 
 ```text
-crates/memoria          façade crate and examples (no unsafe)
-crates/memoria-core     safe, platform-independent API (no unsafe)
-crates/memoria-sys      Linux/Windows bindings (the only unsafe code)
-crates/memoria-integration-tests
+crates/memdiver          façade crate and examples (no unsafe)
+crates/memdiver-core     safe, platform-independent API (no unsafe)
+crates/memdiver-sys      Linux/Windows bindings (the only unsafe code)
+crates/memdiver-integration-tests
                         fixture binary + end-to-end tests
 ```
 
 Dependency direction is strictly one-way:
-`memoria` → `memoria-core` → `memoria-sys`.
+`memdiver` → `memdiver-core` → `memdiver-sys`.
 
 ### Toolchain
 

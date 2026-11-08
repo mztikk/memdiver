@@ -46,14 +46,14 @@ build:
 
 # Run the process inspection example.
 example:
-    cargo run -p memoria --example inspect
+    cargo run -p memdiver --example inspect
 
 # Run the self-read example.
 example-self:
-    cargo run -p memoria --example read_self
+    cargo run -p memdiver --example read_self
 
 # List the files that would be packaged for each library crate.
 package:
-    cargo package --list --allow-dirty -p memoria-sys
-    cargo package --list --allow-dirty -p memoria-core
-    cargo package --list --allow-dirty -p memoria
+    cargo package --list --allow-dirty -p memdiver-sys
+    cargo package --list --allow-dirty -p memdiver-core
+    cargo package --list --allow-dirty -p memdiver

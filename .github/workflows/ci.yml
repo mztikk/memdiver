@@ -35,11 +35,11 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
       - name: Package contents
         run: |
-          cargo package --list -p memoria-sys
-          cargo package --list -p memoria-core
-          cargo package --list -p memoria
+          cargo package --list -p memdiver-sys
+          cargo package --list -p memdiver-core
+          cargo package --list -p memdiver
       - name: Verify sys package
-        run: cargo package -p memoria-sys
+        run: cargo package -p memdiver-sys
 
   windows:
     name: Windows (stable)
