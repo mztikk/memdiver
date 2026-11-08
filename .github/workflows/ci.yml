@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  linux:
+    name: Linux (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --all-targets --all-features
+      - name: Documentation tests
+        run: cargo test --workspace --doc --all-features
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --all-features
+      - name: Package contents
+        run: |
+          cargo package --list -p memoria-sys
+          cargo package --list -p memoria-core
+          cargo package --list -p memoria
+      - name: Verify sys package
+        run: cargo package -p memoria-sys
+
+  windows:
+    name: Windows (stable)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --all-targets --all-features
+      - name: Documentation tests
+        run: cargo test --workspace --doc --all-features
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Windows target for MSRV
+        run: rustup target add --toolchain 1.85.0 x86_64-pc-windows-gnu
+      - name: Check workspace
+        run: cargo +1.85.0 check --workspace --all-targets --all-features --locked
+      - name: Check Windows target
+        run: cargo +1.85.0 check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu --locked
