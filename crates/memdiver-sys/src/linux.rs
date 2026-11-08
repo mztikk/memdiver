@@ -20,8 +20,13 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, ErrorKind, Protection, RawModule, RawRegion, RegionKind, io_message};
+use crate::{
+    Error, ErrorKind, PointerWidth, Protection, RawModule, RawProcessInfo, RawRegion, RegionKind,
+    io_message,
+};
 
+const COMM: &CStr = c"comm";
+const EXE: &CStr = c"exe";
 const MEM: &CStr = c"mem";
 const STAT: &CStr = c"stat";
 const MAPS: &CStr = c"maps";
@@ -57,6 +62,23 @@ impl ProcessHandle {
     /// reused during open, and [`ErrorKind::MalformedData`] when procfs data
     /// cannot be parsed.
     pub fn open(pid: u32) -> Result<Self, Error> {
+        Self::open_with(pid, true)
+    }
+
+    /// Opens a handle to the process with the given PID.
+    ///
+    /// When `writable` is false the memory file is opened read-only and write
+    /// calls fail at the operating-system level. Higher layers should reject
+    /// writes before reaching this point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::NotFound`] when the process does not exist,
+    /// [`ErrorKind::PermissionDenied`] when the ptrace access check denies the
+    /// caller, [`ErrorKind::ProcessExited`] when the process exits or its PID is
+    /// reused during open, and [`ErrorKind::MalformedData`] when procfs data
+    /// cannot be parsed.
+    pub fn open_with(pid: u32, writable: bool) -> Result<Self, Error> {
         let proc_dir = File::open(format!("/proc/{pid}")).map_err(io_error)?;
 
         // Read the identity before and after opening the memory file. If the
@@ -64,7 +86,12 @@ impl ProcessHandle {
         // rejected instead of combining one process's memory with another
         // process's metadata.
         let before = read_stat(&proc_dir, pid)?;
-        let mem = open_proc_file(&proc_dir, MEM, libc::O_RDWR).map_err(io_error)?;
+        let flags = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        let mem = open_proc_file(&proc_dir, MEM, flags).map_err(io_error)?;
         let after = read_stat(&proc_dir, pid)?;
         if before.start_time != after.start_time || is_dead_state(after.state) {
             return Err(process_exited(pid));
@@ -82,6 +109,54 @@ impl ProcessHandle {
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Returns the pointer width of the target process, derived from the ELF
+    /// class of its executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the executable cannot be read or its ELF header is
+    /// malformed.
+    pub fn pointer_width(&self) -> Result<PointerWidth, Error> {
+        let mut file = open_proc_file(&self.proc_dir, EXE, libc::O_RDONLY).map_err(io_error)?;
+        let mut header = [0u8; 5];
+        file.read_exact(&mut header).map_err(io_error)?;
+        if header.get(..4) != Some(b"\x7fELF") {
+            return Err(Error::malformed(
+                "process executable does not start with an ELF header",
+            ));
+        }
+        match header[4] {
+            1 => Ok(PointerWidth::Bits32),
+            2 => Ok(PointerWidth::Bits64),
+            class => Err(Error::malformed(format!(
+                "unknown ELF class {class} for process executable"
+            ))),
+        }
+    }
+
+    /// Returns the executable path recorded by the kernel, when available.
+    ///
+    /// A trailing `" (deleted)"` marker is removed. `None` is returned when the
+    /// process has no executable or the kernel does not expose the link.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unexpected procfs failures.
+    pub fn exe_path(&self) -> Result<Option<PathBuf>, Error> {
+        match read_link_at(&self.proc_dir, EXE) {
+            Ok(path) => Ok(Some(strip_deleted(path))),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(io_error(error)),
+        }
     }
 
     /// Reads up to `buffer.len()` bytes starting at `address`.
@@ -199,6 +274,104 @@ impl ProcessHandle {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Enumerates visible processes.
+///
+/// The list is sorted by PID. Individual processes that exit or cannot be
+/// inspected are skipped rather than failing the whole enumeration.
+///
+/// # Errors
+///
+/// Returns an error when `/proc` itself cannot be read.
+pub fn processes() -> Result<Vec<RawProcessInfo>, Error> {
+    let entries = std::fs::read_dir("/proc").map_err(io_error)?;
+    let mut processes = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        if let Some(info) = process_info(pid) {
+            processes.push(info);
+        }
+    }
+    processes.sort_by_key(|process| process.pid);
+    Ok(processes)
+}
+
+fn process_info(pid: u32) -> Option<RawProcessInfo> {
+    let dir = File::open(format!("/proc/{pid}")).ok()?;
+    let exe_path = read_link_at(&dir, EXE).ok().map(strip_deleted);
+    let comm = read_proc_file(&dir, COMM).ok().and_then(|data| {
+        let end = data
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(data.len());
+        let name = String::from_utf8_lossy(data.get(..end)?).into_owned();
+        (!name.is_empty()).then_some(name)
+    });
+
+    let exe_name = exe_path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned());
+    let name = exe_name.or(comm)?;
+    Some(RawProcessInfo {
+        pid,
+        name,
+        exe_path,
+    })
+}
+
+fn strip_deleted(path: PathBuf) -> PathBuf {
+    let bytes = path.into_os_string().into_vec();
+    let stripped = bytes.strip_suffix(b" (deleted)").unwrap_or(&bytes);
+    PathBuf::from(OsString::from_vec(stripped.to_vec()))
+}
+
+fn read_link_at(dir: &File, name: &CStr) -> io::Result<PathBuf> {
+    let mut capacity = 256;
+    loop {
+        let mut buffer = vec![0u8; capacity];
+        // SAFETY: `dir` is an open directory descriptor, `name` is a valid
+        // NUL-terminated name relative to it, and `buffer` is writable for
+        // `capacity` bytes. readlinkat does not add a NUL terminator.
+        let length = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(PathBuf::from(OsString::from_vec(buffer)));
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .filter(|capacity| *capacity <= 1024 * 1024)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process executable path is unreasonably long",
+                )
+            })?;
     }
 }
 

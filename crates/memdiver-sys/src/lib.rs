@@ -35,12 +35,12 @@ use bitflags::bitflags;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::ProcessHandle;
+pub use linux::{ProcessHandle, processes};
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::ProcessHandle;
+pub use windows::{ProcessHandle, processes};
 
 #[cfg(not(any(target_os = "linux", windows)))]
 compile_error!("memdiver supports only Linux and Windows targets");
@@ -105,6 +105,26 @@ impl fmt::Display for Protection {
             f.write_str("+guard")?;
         }
         Ok(())
+    }
+}
+
+/// Width of a pointer in the target process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PointerWidth {
+    /// 32-bit pointers.
+    Bits32,
+    /// 64-bit pointers.
+    Bits64,
+}
+
+impl PointerWidth {
+    /// Returns the pointer width in bytes.
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::Bits32 => 4,
+            Self::Bits64 => 8,
+        }
     }
 }
 
@@ -219,6 +239,17 @@ pub struct RawRegion {
     pub kind: RegionKind,
     /// File backing the mapping, when the platform reports one.
     pub path: Option<PathBuf>,
+}
+
+/// A process entry as reported by the operating system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawProcessInfo {
+    /// Process identifier.
+    pub pid: u32,
+    /// Process image name, normally the executable file name.
+    pub name: String,
+    /// Full executable path when the operating system exposes it.
+    pub exe_path: Option<PathBuf>,
 }
 
 /// A loaded module as reported by the operating system.

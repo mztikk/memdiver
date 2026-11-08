@@ -43,8 +43,9 @@ Dependency direction is strictly one-way.
 * `crates/memdiver-sys` owns every OS mechanism: file descriptors, Win32 handles,
   procfs parsing, memory APIs, module enumeration. It defines no polished
   end-user ergonomics and does no type reinterpretation for callers.
-* `crates/memdiver-core` owns the safe API: `Address`, `Process`, `Error`,
-  `Region`, `Module`, typed I/O. It must not contain platform FFI.
+* `crates/memdiver-core` owns the safe API: `Address`, `Process`, `ProcessInfo`,
+  `Error`, `Region`, `Module`, `Pattern`, `ScanOptions`, pointer/string
+  helpers, and typed I/O. It must not contain platform FFI.
 * `crates/memdiver` re-exports the public API and holds user-facing
   documentation and examples.
 * `crates/memdiver-integration-tests` contains the fixture binary and tests that
@@ -82,7 +83,19 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
    writes are no-ops that do not touch the target. Non-empty ranges that
    overflow `u64` are rejected before any OS call. `protect` rejects empty
    ranges.
-10. **No logging or printing from library code.** Callers decide how to report
+10. **Read-only handles never write.** `ProcessAccess::ReadOnly` must reject
+    `write`, `write_value` (for non-empty values) and `protect` with
+    `Error::ReadOnly` before any OS call. Zero-length writes remain no-ops.
+11. **Name-based opening is unambiguous.** `open_by_name` must never silently
+    pick one of several matches; return the candidate list. Verify the opened
+    image name after opening and retry a bounded number of times when the
+    matching process is replaced.
+12. **Scans are best-effort and bounded.** Pattern scans skip unreadable,
+    guard, and failed-read chunks, protect against unbounded result vectors with
+    `ScanOptions::max_results`, and overlap chunks so patterns spanning a chunk
+    boundary are still found. `find_pattern` searches modules; `find_patterns`
+    searches all readable memory. Document the difference.
+13. **No logging or printing from library code.** Callers decide how to report
     failures. Examples and the fixture may print.
 
 ## Unsafe code policy
@@ -126,6 +139,11 @@ in `memdiver-sys`.
 * Opening `/proc/<pid>/mem` goes through the ptrace access check; failures are
   usually `AccessDenied`. `kernel.yama.ptrace_scope` and container capabilities
   are documented in the README.
+* Process enumeration reads `/proc`. Prefer the executable basename from
+  `/proc/<pid>/exe`, fall back to `/proc/<pid>/comm` (15-character limit), skip
+  processes that vanish mid-scan, and sort by PID. Matching is case-sensitive.
+* Pointer width comes from the ELF class byte of `/proc/<pid>/exe`. Reject
+  non-ELF or unknown classes as malformed data.
 * Linux cannot change another process's page protection. `protect` must return
   `Unsupported`.
 
@@ -133,13 +151,20 @@ in `memdiver-sys`.
 
 * Request the rights you actually use: query, VM read, VM write, VM operation,
   synchronize. If a right is missing, opening fails with `AccessDenied`.
-* `OpenProcess` returns a null handle on failure. If Tool Help is ever used
-  again, remember `CreateToolhelp32Snapshot` returns `INVALID_HANDLE_VALUE`;
-  check the correct sentinel and capture `GetLastError` immediately. Module
-  enumeration must stay handle-based.
-* Use the **pinned handle** for every query. Tool Help module enumeration takes
-  a PID and is therefore forbidden for module lists; use
-  `EnumProcessModulesEx` + `GetModuleInformation` + `GetModuleFileNameExW`.
+* `OpenProcess` returns a null handle on failure. `CreateToolhelp32Snapshot`
+  returns `INVALID_HANDLE_VALUE`; process enumeration uses it, so check the
+  sentinel, capture `GetLastError` immediately, and retry `ERROR_BAD_LENGTH`.
+  Module enumeration must stay handle-based.
+* Use the **pinned handle** for every query. Tool Help process enumeration is
+  allowed because it is inherently a system-wide snapshot; process handles
+  used afterward must be pinned. Tool Help module enumeration takes a PID and
+  is therefore forbidden for module lists; use `EnumProcessModulesEx` +
+  `GetModuleInformation` + `GetModuleFileNameExW`.
+* During process enumeration, image paths and metadata may be queried with a
+  short-lived `PROCESS_QUERY_LIMITED_INFORMATION` handle; failures mean `None`,
+  not a failed enumeration. Match names ASCII case-insensitively.
+* Pointer width comes from `IsWow64Process`; a WOW64 target is 32-bit, otherwise
+  fall back to host pointer width.
 * Module enumeration can race with module load/unload. Retry a bounded number
   of times on `ERROR_PARTIAL_COPY` / `ERROR_INSUFFICIENT_BUFFER`; never loop
   forever.
@@ -165,9 +190,11 @@ in `memdiver-sys`.
 Tests live at the lowest level that can observe the behaviour:
 
 * **Pure logic** (address arithmetic, protection translation, procfs parsing,
-  stat parsing, module merging, region containment, error formatting) gets unit
-  tests next to the code, including boundary and malformed-input cases.
-* **Platform behaviour** (open, read, write, typed I/O, regions, modules,
+  stat parsing, module merging, region containment, pattern parsing/matching,
+  chunk scanning, pointer arithmetic, error formatting) gets unit tests next to
+  the code, including boundary and malformed-input cases.
+* **Platform behaviour** (process discovery, name-based open, read-only access,
+  read, write, typed I/O, regions, modules, scanning, pointers, strings,
   protection, liveness) gets end-to-end tests in
   `crates/memdiver-integration-tests` against the fixture child.
 * Tests must use the public API from `memdiver`, not `memdiver-sys` internals.
@@ -208,7 +235,8 @@ Do this deliberately; do not skip it because the diff is small.
    error paths, `Send`/`Sync` implications.
 4. Walk the error paths: does every failure keep context and the OS source?
    Is a short transfer an error? Is a dead process detected?
-5. Check the Linux vs Windows feature matrix and README for drift.
+5. Check the Linux vs Windows feature matrix, crate docs, README, and skills
+   for drift. New public operations need a matrix row and an integration test.
 6. Confirm tests actually exercise new behaviour; a test that cannot fail is a
    liability.
 7. Verify `cargo fmt --all -- --check` and `cargo clippy ... -D warnings` are

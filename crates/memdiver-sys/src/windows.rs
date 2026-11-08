@@ -13,11 +13,15 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_ADDRESS,
-    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, ERROR_PARTIAL_COPY,
-    GetLastError, HANDLE, HMODULE, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_ADDRESS, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+    ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, GetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
@@ -28,19 +32,28 @@ use windows_sys::Win32::System::ProcessStatus::{
     EnumProcessModulesEx, GetModuleFileNameExW, GetModuleInformation, LIST_MODULES_ALL, MODULEINFO,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, WaitForSingleObject,
+    IsWow64Process, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, QueryFullProcessImageNameW,
+    WaitForSingleObject,
 };
 
-use crate::{Error, ErrorKind, Protection, RawModule, RawRegion, RegionKind, io_message};
+use crate::{
+    Error, ErrorKind, PointerWidth, Protection, RawModule, RawProcessInfo, RawRegion, RegionKind,
+    io_message,
+};
 
-const ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_QUERY_INFORMATION
+const READ_WRITE_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_QUERY_INFORMATION
     | PROCESS_VM_OPERATION
     | PROCESS_VM_READ
     | PROCESS_VM_WRITE
     | PROCESS_SYNCHRONIZE;
 
+const READ_ONLY_ACCESS: PROCESS_ACCESS_RIGHTS =
+    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SYNCHRONIZE;
+
 const MAX_MODULE_ATTEMPTS: u32 = 8;
+const MAX_PROCESS_ATTEMPTS: u32 = 8;
 
 /// A pinned handle to a Windows process.
 ///
@@ -68,6 +81,20 @@ impl ProcessHandle {
     /// already exited, [`ErrorKind::PermissionDenied`] when `OpenProcess` is
     /// denied, and [`ErrorKind::Other`] for any other Win32 failure.
     pub fn open(pid: u32) -> Result<Self, Error> {
+        Self::open_with(pid, true)
+    }
+
+    /// Opens a handle to the process with the given PID.
+    ///
+    /// A read-only handle is opened with query, VM-read, and synchronize rights
+    /// only. Write and protection operations then fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::NotFound`] for an invalid PID or a process that has
+    /// already exited, [`ErrorKind::PermissionDenied`] when `OpenProcess` is
+    /// denied, and [`ErrorKind::Other`] for any other Win32 failure.
+    pub fn open_with(pid: u32, writable: bool) -> Result<Self, Error> {
         if pid == 0 {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -76,9 +103,14 @@ impl ProcessHandle {
             ));
         }
 
+        let access = if writable {
+            READ_WRITE_ACCESS
+        } else {
+            READ_ONLY_ACCESS
+        };
         // SAFETY: OpenProcess has no pointer preconditions. The returned handle
         // is checked for null and owned by the ProcessHandle on success.
-        let handle = unsafe { OpenProcess(ACCESS, 0, pid) };
+        let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle.is_null() {
             let code = last_error_code();
             let kind = match code {
@@ -99,6 +131,39 @@ impl ProcessHandle {
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Returns the pointer width of the target process.
+    ///
+    /// A 32-bit WOW64 process is reported as [`PointerWidth::Bits32`]; otherwise
+    /// the width follows the bitness of the current host process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `IsWow64Process` fails.
+    pub fn pointer_width(&self) -> Result<PointerWidth, Error> {
+        let mut wow64 = 0i32;
+        // SAFETY: the handle is owned by `self` and `wow64` is writable.
+        let succeeded = unsafe { IsWow64Process(self.handle.as_handle(), &mut wow64) };
+        if succeeded == 0 {
+            return Err(last_error());
+        }
+        if wow64 != 0 || cfg!(target_pointer_width = "32") {
+            Ok(PointerWidth::Bits32)
+        } else {
+            Ok(PointerWidth::Bits64)
+        }
+    }
+
+    /// Returns the executable path recorded by the operating system, when
+    /// available.
+    ///
+    /// # Errors
+    ///
+    /// This backend currently reports an unavailable path as `None` rather than
+    /// an error; the result type leaves room for future diagnostics.
+    pub fn exe_path(&self) -> Result<Option<PathBuf>, Error> {
+        Ok(query_image_path(self.handle.as_handle()))
     }
 
     /// Reads up to `buffer.len()` bytes starting at `address`.
@@ -476,6 +541,119 @@ impl ProcessHandle {
             ))
         }
     }
+}
+
+/// Enumerates visible processes.
+///
+/// The list is sorted by PID. Processes that exit or whose image path cannot be
+/// queried are still listed when the snapshot provides their name; inaccessible
+/// paths are reported as `None`.
+///
+/// # Errors
+///
+/// Returns an error when the process snapshot cannot be created or read after a
+/// bounded number of retries.
+pub fn processes() -> Result<Vec<RawProcessInfo>, Error> {
+    let mut attempt = 0;
+    loop {
+        match process_snapshot() {
+            Ok(processes) => return Ok(processes),
+            Err(error)
+                if is_retryable_process_error(&error) && attempt + 1 < MAX_PROCESS_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn process_snapshot() -> Result<Vec<RawProcessInfo>, Error> {
+    // SAFETY: CreateToolhelp32Snapshot has no pointer preconditions. The
+    // returned handle is checked and owned on success.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+    let snapshot = OwnedHandle::new(snapshot);
+
+    // SAFETY: PROCESSENTRY32W is plain-old-data and zero is valid.
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: the snapshot handle is valid and `entry` is writable.
+    if unsafe { Process32FirstW(snapshot.as_handle(), &mut entry) } == 0 {
+        let error = last_error();
+        return if error.raw_code() == Some(ERROR_NO_MORE_FILES as i32) {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        };
+    }
+
+    let mut processes = Vec::new();
+    loop {
+        let pid = entry.th32ProcessID;
+        if pid != 0 {
+            let name = wide_to_string(&entry.szExeFile);
+            let exe_path = limited_image_path(pid);
+            if !name.is_empty() || exe_path.is_some() {
+                let name = if name.is_empty() {
+                    exe_path.as_deref().map(file_name).unwrap_or_default()
+                } else {
+                    name
+                };
+                processes.push(RawProcessInfo {
+                    pid,
+                    name,
+                    exe_path,
+                });
+            }
+        }
+
+        // SAFETY: PROCESSENTRY32W is plain-old-data and zero is valid.
+        entry = unsafe { zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: the snapshot handle is valid and `entry` is writable.
+        if unsafe { Process32NextW(snapshot.as_handle(), &mut entry) } == 0 {
+            let code = last_error_code();
+            if code == ERROR_NO_MORE_FILES {
+                break;
+            }
+            return Err(win_error(code));
+        }
+    }
+
+    processes.sort_by_key(|process| process.pid);
+    Ok(processes)
+}
+
+fn limited_image_path(pid: u32) -> Option<PathBuf> {
+    // SAFETY: OpenProcess has no pointer preconditions.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let handle = OwnedHandle::new(handle);
+    query_image_path(handle.as_handle())
+}
+
+fn query_image_path(handle: HANDLE) -> Option<PathBuf> {
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    // SAFETY: the handle was opened for query access, the buffer is writable
+    // for `length` UTF-16 units, and `length` is a valid in/out size.
+    let succeeded = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length)
+    };
+    if succeeded == 0 || length == 0 || length as usize >= buffer.len() {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(wide_to_string(&buffer)))
+}
+
+fn is_retryable_process_error(error: &Error) -> bool {
+    error.raw_code() == Some(ERROR_BAD_LENGTH as i32)
 }
 
 fn is_retryable_module_error(error: &Error) -> bool {

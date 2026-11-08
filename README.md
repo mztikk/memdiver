@@ -18,15 +18,21 @@ or real cross-process integration tests.
 | Operation | Linux | Windows |
 |-----------|:-----:|:-------:|
 | Open and pin a process by PID | yes | yes |
+| Enumerate processes and open by name | yes | yes |
+| Read-only process handles | yes | yes |
 | Read bytes at an address | yes | yes |
 | Write bytes at an address | yes | yes |
 | Typed `Pod` reads and writes (unaligned safe) | yes | yes |
 | Enumerate committed memory regions | yes | yes |
 | Look up the region containing an address | yes | yes |
 | Enumerate loaded modules | yes | yes |
-| Look up a module by name | yes | yes |
+| Look up a module by name or address | yes | yes |
 | Read region protection | yes | yes |
 | Change region protection | no | yes |
+| Wildcard pattern scan in one module or all modules | yes | yes |
+| Wildcard pattern scan in all readable memory | yes | yes |
+| Pointer width detection and pointer chains | yes | yes |
+| Bounded C strings and UTF-16LE strings | yes | yes |
 | Detect target exit | yes | yes |
 | PID reuse cannot redirect access | yes | yes |
 
@@ -36,6 +42,17 @@ or real cross-process integration tests.
   `/proc/<pid>` descriptors and the process start time, so later queries cannot
   silently attach to a process that reused the PID. On Windows the kernel
   `HANDLE` is kept for every operation, including module enumeration.
+* **Process discovery without silent ambiguity.** `Process::list` enumerates
+  visible processes; `Process::open_by_name` opens only a unique match and
+  reports candidates when several processes share a name.
+* **Pattern scanning built in.** Wildcard and nibble-mask patterns can be
+  scanned in one module, across every module (`find_pattern`), or across all
+  readable memory, with chunked reads, alignment filtering, and result limits.
+* **Navigation primitives.** Pointer-width detection, pointer-chain resolution,
+  bounded C/UTF-16 string reads, and module-at-address lookup turn raw addresses
+  into usable values.
+* **Read-only handles.** Open with `ProcessAccess::ReadOnly` when writes are not
+  needed; write and protection operations are rejected before any OS call.
 * **No silent truncation.** A read or write that transfers fewer bytes than
   requested returns `Error::PartialRead` / `Error::PartialWrite` with both
   counts. Nothing is quietly shortened.
@@ -106,6 +123,38 @@ fn main() -> Result<(), memdiver::Error> {
 }
 ```
 
+A typical discovery-and-scan workflow:
+
+```rust
+use memdiver::{Pattern, Process, ScanOptions};
+
+fn main() -> Result<(), memdiver::Error> {
+    // Fails with ProcessNameNotFound or AmbiguousProcessName instead of
+    // silently picking a random process.
+    let process = Process::open_by_name("game.exe")?;
+
+    let pattern = Pattern::parse("48 8B 05 ?? ?? ?? ??")?;
+    if let Some(hit) = process.find_pattern(&pattern)? {
+        // find_pattern searches every loaded module; attribute the hit...
+        let module = process.module_at(hit)?.expect("hit is in a module");
+        println!("hit in {} at {hit}", module.name());
+
+        // ...then follow a pointer chain. Offsets are applied after each
+        // dereference; the last one is the final displacement.
+        let width = process.pointer_width()?;
+        let target = process.resolve_pointer_chain(hit, &[0x3, 0x10], width)?;
+
+        // Strings are always bounded.
+        let label = process.read_c_string(target, 256)?;
+        println!("label bytes: {label:02x?}");
+
+        let _all = process.find_patterns(&pattern, &ScanOptions::default())?;
+    }
+
+    Ok(())
+}
+```
+
 Reading a value out of your own process is a self-contained way to try the API:
 
 ```rust
@@ -126,17 +175,26 @@ fn main() -> Result<(), memdiver::Error> {
 
 | Item | Purpose |
 |------|---------|
-| `Process::open(pid)` | Open and pin a process. |
-| `Process::pid()` | PID of the pinned process. |
+| `Process::open(pid)` / `open_readonly(pid)` | Open and pin a process with read-write or read-only access. |
+| `Process::list()` | Enumerate visible processes as `ProcessInfo`. |
+| `Process::find_by_name(name)` | Find all matching processes. |
+| `Process::open_by_name(name)` | Open the unique match, or return an ambiguity error. |
+| `Process::pid()` / `name()` / `exe_path()` | Identity of the pinned process. |
 | `Process::is_alive()` | Liveness, zombie-aware on Linux. |
 | `Process::read` / `write` | Byte-slice transfers. |
 | `Process::read_bytes` | Allocate and read a byte range. |
 | `Process::read_value` / `write_value` | Typed `Pod` transfers. |
-| `Process::regions` | Committed regions, sorted by base address. |
-| `Process::region_at` | Region containing an address. |
-| `Process::modules` / `module` | Loaded executable modules. |
+| `Process::regions` / `region_at` | Committed regions and address lookup. |
+| `Process::modules` / `module` / `module_at` | Loaded executable modules and address lookup. |
+| `Process::find_pattern` | First match across every loaded module. |
+| `Process::find_patterns` | All matches across readable memory. |
+| `Process::find_pattern_in_module` / `find_patterns_in_module` / `find_patterns_in_modules` | Module-scoped scans. |
+| `Process::pointer_width` / `read_pointer` / `resolve_pointer_chain` | Pointer-width detection and chain traversal. |
+| `Process::read_c_string` / `read_c_string_lossy` / `read_utf16_string` | Bounded string reads. |
 | `Process::protect` | Change page protection (Windows only). |
 | `Address` | `u64` target address with checked arithmetic and hex formatting. |
+| `Pattern`, `ScanOptions` | Wildcard patterns and scan filtering. |
+| `PointerWidth`, `ProcessAccess`, `ProcessInfo` | Public supporting types. |
 | `Protection` | Read / write / execute / guard flags. |
 | `Region`, `Module` | Snapshots with base, size, bounds checks, and metadata. |
 
@@ -176,6 +234,12 @@ not claim success.
 * Modules are file-backed mappings with at least one executable segment. All
   segments of the same file are merged. Anonymous executable mappings are not
   modules.
+* Process enumeration reads `/proc`, preferring the executable file name and
+  falling back to `/proc/<pid>/comm`. Names match case-sensitively.
+* Pointer width comes from the ELF class of `/proc/<pid>/exe`.
+* Pattern scans read readable, non-guard regions in chunks with overlap.
+  Unreadable regions and failed chunk reads are skipped; scans are best-effort
+  over live memory.
 * The process start time from `/proc/<pid>/stat` is captured at open time and
   compared on later queries, so a reused PID is not mistaken for the original
   process. Zombies are reported as not alive.
@@ -218,6 +282,11 @@ cat /proc/sys/kernel/yama/ptrace_scope
 * Modules come from `EnumProcessModulesEx` through the pinned handle, with
   `GetModuleInformation` and `GetModuleFileNameExW` for metadata. Enumeration is
   retried when the module list changes during a snapshot.
+* Process enumeration uses a Tool Help process snapshot; image paths and
+  metadata are queried with limited-rights handles where possible. Names match
+  ASCII case-insensitively.
+* Pointer width uses `IsWow64Process`.
+* Pattern scans skip unreadable and guard regions and skip failed chunk reads.
 * `Process::protect` uses `VirtualProtectEx` and returns the previous protection
   of the first page in the range. Windows cannot represent write-only pages, or
   pages that are writable and executable without being readable; those requests
@@ -233,7 +302,8 @@ This library gives the caller the ability to read and modify arbitrary memory in
 a process it has been granted access to. The OS permission model is the only
 access boundary. Writing to a live process can corrupt its state or crash it.
 Reading memory can expose secrets. Use the library only with processes and data
-you are authorized to access.
+you are authorized to access. Prefer `Process::open_readonly` (or
+`ProcessAccess::ReadOnly` via `Process::open_with`) when writes are not needed.
 
 Typed reads are memory-safe in Rust because only `Pod` types are accepted, but
 the bytes read can still be semantically invalid for the target program. The
@@ -245,12 +315,20 @@ required.
 ## Limitations
 
 * Linux and Windows only. Other targets fail to compile with an explicit error.
-* Processes are opened by PID; process-name enumeration and symbol resolution
-  are out of scope.
+* Processes are opened by PID or by a unique image name; matching by path or
+  command line and symbol resolution are out of scope.
 * Linux cannot change page protections.
 * There is no batching/vectored I/O API yet.
 * Reads and writes are not atomic with respect to the target's own accesses.
 * The library never attaches a debugger, suspends threads, or injects code.
+* Pattern scans are best-effort snapshots of live memory: unreadable regions and
+  failed chunk reads are skipped, and there is no cancellation/progress API yet.
+* Process-name matching uses the platform's process image name. Linux
+  `comm` names are only used when the executable name is unavailable.
+* Wildcard patterns support whole bytes and nibble masks; there is no regular
+  expression or string-mask syntax.
+* Pointer chains use caller-supplied offsets; the library does not discover
+  pointer paths.
 * On a 32-bit Windows build, addresses above `usize::MAX` cannot be passed to
   the Win32 APIs, and module enumeration is subject to the OS's 32/64-bit
   limitations. Build `memdiver` for the target's bitness when full access is
@@ -266,8 +344,11 @@ just example         # run the inspection example
 
 The end-to-end suite starts a real child process (`memdiver-fixture`), reads and
 writes its heap buffer through the public API, and verifies the results from the
-child's point of view. It also exercises regions, modules, protection changes
-(Windows), liveness, PID-reuse safety, errors, and concurrent access.
+child's point of view. It also exercises process discovery and by-name opening,
+read-only handles, regions, modules, pattern scanning (including a signature
+embedded in the fixture's executable), pointer chains, bounded strings,
+protection changes (Windows), liveness, PID-reuse safety, errors, and concurrent
+access.
 
 Windows behaviour is type-checked and linted on Linux via the
 `x86_64-pc-windows-gnu` target and fully executed on Windows in CI. See [AGENTS.md](AGENTS.md) and the

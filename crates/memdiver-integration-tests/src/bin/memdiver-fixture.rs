@@ -21,6 +21,12 @@ const BUFFER_LEN: usize = 4096;
 const MULTIPLIER: u8 = 37;
 const ADDEND: u8 = 11;
 
+/// Keep this byte-for-byte in sync with `MODULE_SIGNATURE` in the test harness.
+#[used]
+static MODULE_SIGNATURE: [u8; 16] = [
+    0xDE, 0xAD, 0xBE, 0xEF, 0x6D, 0x65, 0x6D, 0x64, 0x69, 0x76, 0x65, 0x72, 0x21, 0x7F, 0x3C, 0x9A,
+];
+
 fn pattern(len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| (index as u8).wrapping_mul(MULTIPLIER).wrapping_add(ADDEND))
@@ -36,6 +42,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn main() -> io::Result<()> {
+    // Force the signature into the image's read-only data so pattern scans that
+    // enumerate modules can find it.
+    std::hint::black_box(&MODULE_SIGNATURE);
+
     let buffer = pattern(BUFFER_LEN);
     let stdout = io::stdout();
     let mut output = stdout.lock();

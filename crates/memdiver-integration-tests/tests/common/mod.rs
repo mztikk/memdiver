@@ -13,6 +13,19 @@ pub const BUFFER_LEN: usize = 4096;
 pub const MULTIPLIER: u8 = 37;
 /// Addend used by the deterministic fixture pattern.
 pub const ADDEND: u8 = 11;
+/// Signature embedded in the fixture executable's read-only data.
+pub const MODULE_SIGNATURE: [u8; 16] = [
+    0xDE, 0xAD, 0xBE, 0xEF, 0x6D, 0x65, 0x6D, 0x64, 0x69, 0x76, 0x65, 0x72, 0x21, 0x7F, 0x3C, 0x9A,
+];
+
+/// Returns `MODULE_SIGNATURE` formatted as a scanning pattern.
+pub fn module_signature_text() -> String {
+    MODULE_SIGNATURE
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Returns the deterministic byte pattern used by the fixture.
 pub fn pattern(len: usize) -> Vec<u8> {

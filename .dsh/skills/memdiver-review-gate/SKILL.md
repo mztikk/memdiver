@@ -37,7 +37,10 @@ just windows-check
 just windows-clippy
 ```
 
-`just check` runs the host commands above; `just ci` adds the Windows checks. All commands
+`just check` runs the host commands above; `just ci` adds the Windows checks.
+The Windows binaries can additionally be exercised under Wine on Linux when a
+prefix and the MinGW target are available; this is a local aid, not a
+replacement for native Windows CI. All commands
 must pass without warnings. If the Windows target is missing, install it with
 `rustup target add x86_64-pc-windows-gnu`. Never commit with a failing gate; if a
 check truly cannot run, say so in the commit body.
@@ -58,6 +61,13 @@ touch code examples.
 * **Error context:** process, address, and length are present where relevant;
   the `OsError` source and raw code are preserved.
 * **Typed access:** only `Pod`; unaligned copies; zero-sized values handled.
+* **Read-only access:** write and protect paths reject `ProcessAccess::ReadOnly`
+  before touching the OS; zero-length writes remain no-ops.
+* **Process discovery:** name matching uses platform case rules, ambiguous names
+  return candidates, and the opened process is verified against its image name.
+* **Scanning:** chunks overlap by `pattern.len() - 1`, unreadable/guard regions
+  are skipped, results are bounded, and `find_pattern` is module-scoped while
+  `find_patterns` is all-memory.
 * **Platform parity:** the README matrix and docs match the implementation;
   unsupported operations return `Unsupported`, never fake success.
 * **Resources:** every handle/descriptor closes exactly once on success and

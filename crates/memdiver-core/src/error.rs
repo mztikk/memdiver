@@ -3,7 +3,7 @@
 use memdiver_sys::Error as OsError;
 use memdiver_sys::ErrorKind as OsErrorKind;
 
-use crate::{Address, Protection};
+use crate::{Address, ProcessInfo, Protection};
 
 /// The error type returned by all memory operations.
 ///
@@ -179,6 +179,83 @@ pub enum Error {
         /// Allocation failure.
         #[source]
         source: std::collections::TryReserveError,
+    },
+
+    /// No process matched the requested name.
+    #[error("no process named {name:?} was found")]
+    ProcessNameNotFound {
+        /// Name that was searched for.
+        name: String,
+    },
+
+    /// More than one process matched the requested name.
+    #[error("process name {name:?} matches multiple processes; select one by PID")]
+    AmbiguousProcessName {
+        /// Name that was searched for.
+        name: String,
+        /// Matching process entries.
+        candidates: Vec<ProcessInfo>,
+    },
+
+    /// The process identity changed while it was being opened by name.
+    #[error("process {name:?} exited or was replaced while it was being opened")]
+    ProcessChanged {
+        /// Name that was being opened.
+        name: String,
+    },
+
+    /// The handle was opened without write access.
+    #[error("process {pid} was opened read-only; {operation} requires write access")]
+    ReadOnly {
+        /// PID of the target process.
+        pid: u32,
+        /// Operation that was rejected.
+        operation: &'static str,
+    },
+
+    /// Enumerating processes failed.
+    #[error("failed to enumerate processes: {source}")]
+    ProcessList {
+        /// Underlying operating-system error.
+        #[source]
+        source: OsError,
+    },
+
+    /// A pointer chain overflowed the target's address width.
+    #[error("pointer chain overflow at {address} while adding {offset:#x} in process {pid}")]
+    PointerChainOverflow {
+        /// PID of the target process.
+        pid: u32,
+        /// Pointer value before the addition that overflowed.
+        address: Address,
+        /// Offset that could not be added.
+        offset: u64,
+    },
+
+    /// A byte pattern could not be parsed.
+    #[error("invalid pattern: {reason}")]
+    InvalidPattern {
+        /// Human-readable reason for the parse failure.
+        reason: String,
+    },
+
+    /// No loaded module matched the requested name.
+    #[error("module {name:?} is not loaded in the target process")]
+    ModuleNotFound {
+        /// Module name that was requested.
+        name: String,
+    },
+
+    /// Querying process metadata failed.
+    #[error("failed to query {what} for process {pid}: {source}")]
+    Query {
+        /// PID of the target process.
+        pid: u32,
+        /// What was being queried.
+        what: &'static str,
+        /// Underlying operating-system error.
+        #[source]
+        source: OsError,
     },
 }
 

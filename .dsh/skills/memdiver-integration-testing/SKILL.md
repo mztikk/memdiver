@@ -13,11 +13,14 @@ Read [AGENTS.md](../../../AGENTS.md) and the
 
 ```text
 crates/memdiver-integration-tests/
-  src/bin/memdiver-fixture.rs   deterministic child process
-  tests/common/mod.rs          handshake + command harness
-  tests/read_write.rs          bytes, typed values, errors, concurrency
-  tests/queries.rs             regions, modules, protection
-  tests/lifecycle.rs           liveness, open failures, dead-process I/O
+  src/bin/memdiver-fixture.rs   deterministic child process + module signature
+  tests/common/mod.rs           handshake, fixture, signature constant
+  tests/read_write.rs           bytes, typed values, errors, concurrency
+  tests/queries.rs              regions, modules, protection, module_at
+  tests/process_selection.rs    process list, by-name open, read-only access
+  tests/scanning.rs             module/heap scans, wildcards, alignment, limits
+  tests/navigation.rs           pointer width/chains, bounded C/UTF-16 strings
+  tests/lifecycle.rs            liveness, open failures, dead-process I/O
 ```
 
 The fixture binary is a target of the same package, so Cargo provides
@@ -50,6 +53,11 @@ spontaneously or on a timer.
 The pattern is `byte[i] = (i * 37 + 11) mod 256`; `common::pattern` and the
 fixture both implement it. Keep them in sync.
 
+The fixture executable also contains `MODULE_SIGNATURE`, a fixed 16-byte
+sequence in read-only data. `common::module_signature_text()` formats it as a
+scan pattern. Keep the fixture and `common` constants byte-identical; module
+scans rely on it being in an image section.
+
 ## Writing a test
 
 * Use `Fixture::spawn()` and access `fixture.process`, `fixture.address`, and
@@ -67,6 +75,18 @@ fixture both implement it. Keep them in sync.
 * Concurrency tests: reads may overlap freely; writes must target disjoint
   byte ranges. Wrap a separately opened `Process` in `Arc` to share it; the
   fixture keeps its own handle.
+* Process-name tests must not assume the fixture name is unique: other tests
+  spawn fixtures concurrently. Use the test executable's unique name for a
+  successful `open_by_name` test, and two fixtures for an ambiguity test.
+* Read-only tests must read successfully and assert `Error::ReadOnly` for
+  `write`, `write_value`, and `protect`.
+* Scan tests need a module-resident signature (`MODULE_SIGNATURE`), a heap-only
+  signature that `find_pattern` must not return, wildcard/nibble cases,
+  alignment, result limits, and a unit test for a match spanning the scan-chunk
+  boundary.
+* Pointer tests must honor `PointerWidth` (write `u32` or `u64` accordingly),
+  check empty chains, and cover width-specific overflow. String tests cover
+  truncation, lossy decoding, unpaired surrogates, and multi-chunk reads.
 * Windows-only tests go behind `#[cfg(windows)]`. Linux-only tests, such as the
   `protect` `Unsupported` case, go behind `#[cfg(target_os = "linux")]`.
 * Use `Address::checked_add` for addresses. Test overflow and zero-length

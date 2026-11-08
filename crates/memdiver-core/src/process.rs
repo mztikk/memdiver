@@ -5,10 +5,34 @@ use std::mem::size_of;
 
 use bytemuck::Pod;
 use memdiver_sys::ErrorKind as OsErrorKind;
-use memdiver_sys::ProcessHandle;
+use memdiver_sys::{ProcessHandle, processes as platform_processes};
 
 use crate::error::open_error;
-use crate::{Address, Error, Module, Protection, Region, Result};
+use crate::process_info::name_matches;
+use crate::{Address, Error, Module, ProcessInfo, Protection, Region, Result};
+
+/// Requested access level for a process handle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProcessAccess {
+    /// Read and write access, including the ability to change protections.
+    #[default]
+    ReadWrite,
+    /// Read-only access. Writes and protection changes are rejected before any
+    /// operating-system call.
+    ReadOnly,
+}
+
+impl ProcessAccess {
+    /// Returns `true` when this access level permits writes.
+    #[must_use]
+    pub fn is_writable(self) -> bool {
+        match self {
+            Self::ReadWrite => true,
+            Self::ReadOnly => false,
+        }
+    }
+}
 
 /// A handle to another process's memory.
 ///
@@ -17,6 +41,10 @@ use crate::{Address, Error, Module, Protection, Region, Result};
 /// handle was opened; on Windows the kernel `HANDLE` pins the process object.
 /// Closing or dropping the `Process` never terminates or otherwise modifies the
 /// target's execution state.
+///
+/// A handle can be opened read-write ([`Process::open`]) or read-only
+/// ([`Process::open_readonly`]). Use [`Process::list`],
+/// [`Process::find_by_name`], and [`Process::open_by_name`] for PID discovery.
 ///
 /// `Process` is [`Send`] and [`Sync`]: reads and writes use positional I/O on
 /// Linux and thread-safe Win32 handle operations on Windows. Concurrent writes
@@ -34,14 +62,16 @@ use crate::{Address, Error, Module, Protection, Region, Result};
 /// inherent in the operation and is documented rather than hidden behind
 /// `unsafe`.
 pub struct Process {
-    pid: u32,
-    inner: ProcessHandle,
+    pub(crate) pid: u32,
+    access: ProcessAccess,
+    pub(crate) inner: ProcessHandle,
 }
 
 impl fmt::Debug for Process {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Process")
             .field("pid", &self.pid)
+            .field("access", &self.access)
             .finish_non_exhaustive()
     }
 }
@@ -55,14 +85,173 @@ impl Process {
     /// [`Error::AccessDenied`] when the operating system denies access, and
     /// [`Error::Open`] for other failures.
     pub fn open(pid: u32) -> Result<Self> {
-        let inner = ProcessHandle::open(pid).map_err(|source| open_error(pid, source))?;
-        Ok(Self { pid, inner })
+        Self::open_with(pid, ProcessAccess::ReadWrite)
+    }
+
+    /// Opens the process with the given PID using an explicit access level.
+    ///
+    /// A [`ProcessAccess::ReadOnly`] handle requests only the rights needed to
+    /// inspect the target. Write and protection operations return
+    /// [`Error::ReadOnly`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ProcessNotFound`] when the process does not exist,
+    /// [`Error::AccessDenied`] when the operating system denies the requested
+    /// access, and [`Error::Open`] for other failures.
+    pub fn open_with(pid: u32, access: ProcessAccess) -> Result<Self> {
+        let inner = ProcessHandle::open_with(pid, access.is_writable())
+            .map_err(|source| open_error(pid, source))?;
+        Ok(Self { pid, access, inner })
+    }
+
+    /// Opens a read-only handle to the process with the given PID.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Process::open_with`].
+    pub fn open_readonly(pid: u32) -> Result<Self> {
+        Self::open_with(pid, ProcessAccess::ReadOnly)
+    }
+
+    /// Enumerates the processes visible to the caller.
+    ///
+    /// The result is sorted by PID. Individual processes that exit or cannot be
+    /// inspected during enumeration are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ProcessList`] when the operating system cannot provide
+    /// a process snapshot.
+    pub fn list() -> Result<Vec<ProcessInfo>> {
+        let processes = platform_processes().map_err(|source| Error::ProcessList { source })?;
+        Ok(processes.into_iter().map(ProcessInfo::from_raw).collect())
+    }
+
+    /// Finds processes whose name matches `name`.
+    ///
+    /// Matching is case-sensitive on Linux and ASCII case-insensitive on
+    /// Windows. The executable file name is considered when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ProcessList`] when the process list cannot be read.
+    pub fn find_by_name(name: &str) -> Result<Vec<ProcessInfo>> {
+        Ok(Self::list()?
+            .into_iter()
+            .filter(|process| process.matches_name(name))
+            .collect())
+    }
+
+    /// Opens the unique process matching `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ProcessNameNotFound`] when nothing matches,
+    /// [`Error::AmbiguousProcessName`] when more than one process matches, and
+    /// the same open errors as [`Process::open`] otherwise.
+    pub fn open_by_name(name: &str) -> Result<Self> {
+        Self::open_by_name_with(name, ProcessAccess::ReadWrite)
+    }
+
+    /// Opens the unique process matching `name` with an explicit access level.
+    ///
+    /// The opened process is verified against its name after opening; a process
+    /// that exits or is replaced during the operation is retried a bounded
+    /// number of times before [`Error::ProcessChanged`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ProcessNameNotFound`] when nothing matches,
+    /// [`Error::AmbiguousProcessName`] when more than one process matches,
+    /// [`Error::ProcessChanged`] when the matching process keeps changing, and
+    /// the same open errors as [`Process::open_with`] otherwise.
+    pub fn open_by_name_with(name: &str, access: ProcessAccess) -> Result<Self> {
+        for _ in 0..3 {
+            let mut candidates = Self::find_by_name(name)?;
+            match candidates.len() {
+                0 => {
+                    return Err(Error::ProcessNameNotFound {
+                        name: name.to_owned(),
+                    });
+                }
+                1 => {
+                    let candidate = candidates.remove(0);
+                    let process = match Self::open_with(candidate.pid(), access) {
+                        Ok(process) => process,
+                        Err(Error::ProcessNotFound { .. }) => continue,
+                        Err(Error::Open { source, .. })
+                            if matches!(source.kind(), OsErrorKind::ProcessExited) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(actual) = process.name()? {
+                        if !name_matches(&actual, name) {
+                            continue;
+                        }
+                    }
+                    return Ok(process);
+                }
+                _ => {
+                    return Err(Error::AmbiguousProcessName {
+                        name: name.to_owned(),
+                        candidates,
+                    });
+                }
+            }
+        }
+        Err(Error::ProcessChanged {
+            name: name.to_owned(),
+        })
     }
 
     /// Returns the PID of the target process.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Returns the access level this handle was opened with.
+    #[must_use]
+    pub fn access(&self) -> ProcessAccess {
+        self.access
+    }
+
+    /// Returns `true` when this handle can write to the target.
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        self.access.is_writable()
+    }
+
+    /// Returns the target's executable path when the operating system exposes
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Query`] for unexpected metadata failures.
+    pub fn exe_path(&self) -> Result<Option<std::path::PathBuf>> {
+        self.inner.exe_path().map_err(|source| Error::Query {
+            pid: self.pid,
+            what: "executable path",
+            source,
+        })
+    }
+
+    /// Returns the target's executable file name when available.
+    ///
+    /// Non-UTF-8 Linux names are converted lossily; use [`Process::exe_path`]
+    /// when the exact path bytes matter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Process::exe_path`].
+    pub fn name(&self) -> Result<Option<String>> {
+        Ok(self.exe_path()?.and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        }))
     }
 
     /// Returns whether the target process is still running.
@@ -140,6 +329,12 @@ impl Process {
     pub fn write(&self, address: Address, buffer: &[u8]) -> Result<()> {
         if buffer.is_empty() {
             return Ok(());
+        }
+        if !self.is_writable() {
+            return Err(Error::ReadOnly {
+                pid: self.pid,
+                operation: "Process::write",
+            });
         }
         validate_range(address, buffer.len())?;
         let transferred =
@@ -261,6 +456,21 @@ impl Process {
         Ok(modules)
     }
 
+    /// Finds the loaded module containing `address`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Process::modules`].
+    pub fn module_at(&self, address: Address) -> Result<Option<Module>> {
+        let modules = self.modules()?;
+        let index = modules.partition_point(|module| module.base() <= address);
+        Ok(index
+            .checked_sub(1)
+            .and_then(|index| modules.get(index))
+            .filter(|module| module.contains(address))
+            .cloned())
+    }
+
     /// Finds a module by exact name.
     ///
     /// Names are compared exactly, including case. Use the iterator returned by
@@ -302,6 +512,12 @@ impl Process {
             return Err(Error::InvalidLength {
                 operation: "Process::protect",
                 len,
+            });
+        }
+        if !self.is_writable() {
+            return Err(Error::ReadOnly {
+                pid: self.pid,
+                operation: "Process::protect",
             });
         }
         validate_range(address, len)?;
@@ -380,6 +596,13 @@ mod tests {
     #[test]
     fn process_is_send_and_sync() {
         assert_send_sync::<Process>();
+    }
+
+    #[test]
+    fn access_levels_report_writability() {
+        assert!(ProcessAccess::ReadWrite.is_writable());
+        assert!(!ProcessAccess::ReadOnly.is_writable());
+        assert_eq!(ProcessAccess::default(), ProcessAccess::ReadWrite);
     }
 
     #[test]

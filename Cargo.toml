@@ -17,10 +17,12 @@ categories = ["os", "api-bindings", "development-tools::debugging"]
 bytemuck = "1"
 bitflags = "2"
 libc = "0.2"
+memchr = "2"
 thiserror = "2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

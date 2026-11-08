@@ -10,18 +10,26 @@ workflow for `crates/memdiver-sys`, the only crate allowed to contain `unsafe`.
 
 ## Contract
 
-Both `src/linux.rs` and `src/windows.rs` expose the same `ProcessHandle` API:
+Both `src/linux.rs` and `src/windows.rs` expose the same `ProcessHandle` API
+(plus a free `processes()` enumeration function):
 
 ```text
 open(pid) -> Result<Self>
+open_with(pid, writable: bool) -> Result<Self>
 pid() -> u32
+exe_path() -> Result<Option<PathBuf>>
+pointer_width() -> Result<PointerWidth>
 read(address: u64, &mut [u8]) -> Result<usize>
 write(address: u64, &[u8]) -> Result<usize>
 is_alive() -> bool
 regions() -> Result<Vec<RawRegion>>
 modules() -> Result<Vec<RawModule>>
 protect(address, len, Protection) -> Result<Protection>
+processes() -> Result<Vec<RawProcessInfo>>
 ```
+
+The safe layer owns name matching, ambiguity handling, scan scoping, pointer
+chains, and string framing; the sys layer returns raw facts only.
 
 Reads and writes return the actual transfer count; the safe layer decides that
 a short transfer is `PartialRead`/`PartialWrite`. Never hide a short transfer
@@ -32,10 +40,12 @@ The pinned-instance invariants are not negotiable:
 
 * Linux: keep `/proc/<pid>` and `/proc/<pid>/mem` open, capture the start time
   from `/proc/<pid>/stat`, and reject zombies/reused PIDs before reopening
-  procfs files. Use `openat` relative to the directory descriptor.
-* Windows: keep the kernel `HANDLE` and use it for every query. Never enumerate
-  modules or query regions by PID alone. Tool Help is PID-based and must not be
-  reintroduced.
+  procfs files. Use `openat` relative to the directory descriptor. Open the
+  memory file `O_RDONLY` for read-only handles.
+* Windows: keep the kernel `HANDLE` and use it for every pinned query. Never
+  enumerate modules or query regions by PID alone. Tool Help is acceptable only
+  for the system-wide process snapshot; process handles used afterward are
+  pinned and opened with only the required rights.
 
 ## Adding an operation
 
@@ -86,6 +96,10 @@ The pinned-instance invariants are not negotiable:
   reject ranges above `i64::MAX`.
 * Modules are file-backed mappings with an executable segment; merge all
   segments of the same file. Anonymous executable mappings are not modules.
+* Process enumeration reads `/proc`, prefers the executable basename, falls back
+  to `comm`, skips vanished processes, and sorts by PID. Name matching is
+  case-sensitive.
+* Pointer width comes from the ELF class byte of `/proc/<pid>/exe`.
 * Linux cannot change another process's protection: return
   `ErrorKind::Unsupported`.
 
@@ -107,6 +121,13 @@ The pinned-instance invariants are not negotiable:
   the first page of a multi-page range.
 * `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` is the liveness check. Do not
   use `GetExitCodeProcess == STILL_ACTIVE`; the exit code is ambiguous.
+* Process enumeration uses `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)`.
+  Check the `INVALID_HANDLE_VALUE` sentinel, capture `GetLastError` immediately,
+  and retry `ERROR_BAD_LENGTH`. Close the snapshot on every path. Query image
+  paths with a short-lived limited-rights handle; failure means `None`.
+* Pointer width uses `IsWow64Process`; a WOW64 target is 32-bit, otherwise use
+  the host pointer width. Core pointer-chain arithmetic must respect the
+  target width.
 * `ReadProcessMemory`/`WriteProcessMemory` may copy partial data and still
   return failure. Report the error; never infer success from bytes copied.
 

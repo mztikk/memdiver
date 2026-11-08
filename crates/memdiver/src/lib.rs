@@ -1,9 +1,11 @@
 //! Read and write the memory of another process on Linux and Windows.
 //!
 //! `memdiver` is a safe, production-oriented library for external process
-//! memory access. It pins the target process when you open it, performs
-//! positional reads and writes through operating-system primitives, and reports
-//! rich errors instead of panicking or silently truncating transfers.
+//! memory access. It pins the target process when you open it, discovers
+//! processes by name, performs positional reads and writes through
+//! operating-system primitives, scans memory for byte patterns, resolves
+//! pointer chains, and reports rich errors instead of panicking or silently
+//! truncating transfers.
 //!
 //! # Example
 //!
@@ -25,13 +27,18 @@
 //!
 //! | Operation | Linux | Windows |
 //! |-----------|:-----:|:-------:|
+//! | Enumerate processes / open by name | yes | yes |
 //! | Open and pin a process | yes | yes |
+//! | Read-only handles | yes | yes |
 //! | Read / write bytes | yes | yes |
 //! | Typed `Pod` read / write | yes | yes |
 //! | Enumerate memory regions | yes | yes |
-//! | Enumerate modules | yes | yes |
+//! | Enumerate modules / module-at-address | yes | yes |
 //! | Query region protection | yes | yes |
 //! | Change region protection | no | yes |
+//! | Pattern scanning (modules or all readable memory) | yes | yes |
+//! | Pointer width and pointer chains | yes | yes |
+//! | Bounded C / UTF-16 strings | yes | yes |
 //!
 //! # Operating-system permission model
 //!
@@ -39,8 +46,9 @@
 //! goes through the kernel's ptrace access check: the caller must be able to
 //! ptrace the target. With `kernel.yama.ptrace_scope = 1` that normally means
 //! the target is a descendant of the caller (or the caller has
-//! `CAP_SYS_PTRACE`). On Windows, `OpenProcess` is requested with query, read,
-//! write, operation and synchronize rights; protected or higher-integrity
+//! `CAP_SYS_PTRACE`). On Windows, `Process::open` requests query, read, write,
+//! operation and synchronize rights; `Process::open_readonly` requests only the
+//! query/read/synchronize rights it needs. Protected or higher-integrity
 //! processes therefore require an elevated caller.
 //!
 //! Writing another process's memory can corrupt or crash it. The API is safe
@@ -60,5 +68,6 @@
 #![forbid(unsafe_code)]
 
 pub use memdiver_core::{
-    Address, Error, Module, OsError, OsErrorKind, Process, Protection, Region, RegionKind, Result,
+    Address, Error, Module, OsError, OsErrorKind, Pattern, PointerWidth, Process, ProcessAccess,
+    ProcessInfo, Protection, Region, RegionKind, Result, ScanOptions,
 };

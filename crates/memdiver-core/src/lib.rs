@@ -2,17 +2,23 @@
 //!
 //! `memdiver-core` is the implementation behind the [`memdiver`] façade. It
 //! exposes [`Process`], an owned handle that pins the target process, plus
-//! typed reads and writes, memory-region queries, and module enumeration.
+//! process discovery, typed reads and writes, memory-region and module queries,
+//! pattern scanning, pointer traversal, and bounded string reads.
 //!
 //! # Platform support
 //!
 //! | Operation | Linux | Windows |
 //! |-----------|-------|---------|
 //! | Open a process and pin it | `/proc/<pid>/mem` descriptor | `OpenProcess` handle |
+//! | Enumerate processes / open by name | `/proc` scan | Tool Help snapshot |
+//! | Read-only handles | read-only procfs descriptor | query/read rights only |
 //! | Read / write bytes | `pread` / `pwrite` on `/proc/<pid>/mem` | `ReadProcessMemory` / `WriteProcessMemory` |
 //! | Typed values | yes | yes |
 //! | Memory regions | parsed from `/proc/<pid>/maps` | `VirtualQueryEx` |
 //! | Modules | executable file mappings from `/proc/<pid>/maps` | `EnumProcessModulesEx` |
+//! | Pattern scanning | chunked readable-memory reads | chunked readable-memory reads |
+//! | Pointer width / chains | ELF class / implicit | `IsWow64Process` / checked pointers |
+//! | Strings | C and UTF-16LE helpers | C and UTF-16LE helpers |
 //! | Change protection | not supported | `VirtualProtectEx` |
 //!
 //! Transfers are all-or-nothing from the API's point of view: an operating
@@ -49,15 +55,22 @@
 mod address;
 mod error;
 mod module;
+mod pattern;
+mod pointer;
 mod process;
+mod process_info;
 mod region;
+mod scan;
+mod strings;
 
 pub use address::Address;
 pub use error::{Error, Result};
 pub use module::Module;
-pub use process::Process;
+pub use pattern::{Pattern, ScanOptions};
+pub use process::{Process, ProcessAccess};
+pub use process_info::ProcessInfo;
 pub use region::Region;
 
 pub use memdiver_sys::Error as OsError;
 pub use memdiver_sys::ErrorKind as OsErrorKind;
-pub use memdiver_sys::{Protection, RegionKind};
+pub use memdiver_sys::{PointerWidth, Protection, RegionKind};
