@@ -69,7 +69,9 @@ touch code examples.
   path, and reports both the write/protection failure and any restore failure.
   It must never return success with a page still modified, and it must not rely
   on `protect`'s first-page return for a multi-page range. Linux skips the
-  protection step and writes through `/proc/<pid>/mem`.
+  protection step and writes through `/proc/<pid>/mem`. The helper does not
+  flush the target's instruction cache: the visibility guarantee is x86/x86_64
+  only, while the API remains available on every supported target.
 * **Process discovery:** name matching uses platform case rules, ambiguous names
   return candidates, and the opened process is verified against its image name.
 * **Scanning:** chunks overlap by `pattern.len() - 1`, unreadable/guard regions
@@ -100,7 +102,10 @@ touch code examples.
 * New error paths assert the structured variant and, where relevant, the source
   error. Composite scoped-write errors must retain both failures and their
   address/range context; if a restore failure cannot be forced through the OS,
-  check for a focused unit test of its construction/formatting.
+  check for a focused unit test of its construction/formatting. Windows
+  multi-page write_code coverage must use the fixture's `MULTI` target with two
+  different initial protections and verify both are restored. Check for the
+  cfg-gated test that scopes instruction-cache coherence to x86/x86_64.
 * Platform-specific branches have a test or a documented reason why they can
   only run in CI.
 * Run the release profile once when touching concurrency or overflow-sensitive

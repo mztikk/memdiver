@@ -47,6 +47,10 @@
 //! | Enable debug privilege | no | yes |
 //! | Module exports (PE / ELF) | yes | yes |
 //!
+//! `Process::write_code` is available on every supported target. Its
+//! instruction-cache coherence guarantee is limited to x86/x86_64; see the
+//! method documentation.
+//!
 //! # Operating-system permission model
 //!
 //! This crate does not elevate privileges. On Linux, opening `/proc/<pid>/mem`

@@ -46,6 +46,7 @@ Then it reads one command per line and writes one response line:
 | `PING` | `PONG` |
 | `PEEK <offset> <length>` | lowercase hex bytes |
 | `CODE` | `CODE <address> <length>` for the executable code target |
+| `MULTI` | Windows only: `MULTI <address> <length> <page_size>` for the two-page target |
 | `EXIT` | exits |
 
 Invalid commands or ranges produce `ERR`. The child is blocked on stdin while
@@ -66,6 +67,14 @@ plus `CODE_LEN` (currently 4). The parent must only write the function's existin
 bytes back through `write_code`; patching different instruction bytes risks
 crashing the fixture if a protection restore ever fails. `common::CODE_LEN` must
 stay in sync with the fixture.
+
+On Windows, `MULTI` exposes a process-lifetime two-page `VirtualAlloc` target.
+The first page is `PAGE_EXECUTE_READ`, the second is `PAGE_READONLY`, and both
+contain the deterministic pattern. The fixture never executes this memory. The
+parent reads the bytes, calls `write_code` over the full two-page range writing
+the same bytes, and verifies both regions still have their original protections.
+If `write_code` only restored the first page's protection, the second page would
+lose its read-only protection and the test would fail.
 
 ## Writing a test
 
@@ -91,13 +100,18 @@ stay in sync with the fixture.
   `write`, `write_code`, `write_value`, and `protect`. Zero-length writes,
   including `write_code`, remain no-ops.
 * `write_code` tests cover the fixture heap, zero-length no-ops, read-only
-  rejection, and overflowing ranges. The Windows test uses `fixture.code_target()`
-  to confirm the address is executable and non-writable, writes its existing
-  bytes with `write_code`, and asserts the region's protection is identical
-  afterwards. Do not rely on a plain `write` failing on that page: Wine and other
-  compatibility layers may not enforce the page protection for
-  `WriteProcessMemory`, so the `VirtualQueryEx`-reported protection is the
-  authoritative check in the test.
+  rejection, and overflowing ranges. The Windows single-page test uses
+  `fixture.code_target()` to confirm the address is executable and non-writable,
+  writes its existing bytes with `write_code`, and asserts the region's
+  protection is identical afterwards. The Windows multi-page test uses
+  `fixture.multi_page_target()`, writes the existing bytes across both pages, and
+  asserts each page's differing original protection is restored. Do not rely on
+  a plain `write` failing on a protected page: Wine and other compatibility
+  layers may not enforce the page protection for `WriteProcessMemory`, so the
+  `VirtualQueryEx`-reported protection is the authoritative check in the tests.
+* The instruction-cache coherence guarantee is x86/x86_64-only. Keep a
+  cfg-gated unit test asserting the documented architecture condition; never
+  fail non-x86 tests because the helper does not flush the cache.
 * Composite restore-error construction cannot be forced reliably through the OS;
   cover its formatting and source chain with a unit test in `memdiver-core` and
   document why.

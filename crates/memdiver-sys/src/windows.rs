@@ -248,6 +248,11 @@ impl ProcessHandle {
     /// have different protections. Restoration is attempted for every page that
     /// was changed, even when one restore fails.
     ///
+    /// The write does not call `FlushInstructionCache`. On x86 and x86_64 the
+    /// instruction and data caches are coherent; on other architectures,
+    /// including ARM64, the target may execute stale instructions. No
+    /// cache-flush operation is provided yet.
+    ///
     /// # Errors
     ///
     /// Returns [`CodeWriteError::Failed`] when the write or a protection change

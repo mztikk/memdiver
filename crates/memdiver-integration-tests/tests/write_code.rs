@@ -138,3 +138,80 @@ fn writes_to_read_only_executable_code_and_restores_protection() {
 
     fixture.ping();
 }
+
+#[cfg(windows)]
+#[test]
+fn multi_page_code_write_restores_differing_protections() {
+    let mut fixture = Fixture::spawn();
+    let target = fixture.multi_page_target();
+    assert_eq!(
+        target.address.get() % target.page_size as u64,
+        0,
+        "multi-page target must be page-aligned"
+    );
+    let second_address = target
+        .address
+        .checked_add(target.page_size as u64)
+        .expect("second page address");
+
+    let first_before = fixture
+        .process
+        .region_at(target.address)
+        .expect("first page region query")
+        .expect("first page must be inside a committed region");
+    let second_before = fixture
+        .process
+        .region_at(second_address)
+        .expect("second page region query")
+        .expect("second page must be inside a committed region");
+    assert!(first_before.is_readable(), "{first_before:?}");
+    assert!(first_before.is_executable(), "{first_before:?}");
+    assert!(!first_before.is_writable(), "{first_before:?}");
+    assert!(second_before.is_readable(), "{second_before:?}");
+    assert!(!second_before.is_executable(), "{second_before:?}");
+    assert!(!second_before.is_writable(), "{second_before:?}");
+    assert_ne!(
+        first_before.protection(),
+        second_before.protection(),
+        "the two pages must start with different protections"
+    );
+
+    let original = fixture
+        .process
+        .read_bytes(target.address, target.len)
+        .expect("read multi-page target");
+    fixture
+        .process
+        .write_code(target.address, &original)
+        .expect("scoped code write across two pages");
+    assert_eq!(
+        fixture
+            .process
+            .read_bytes(target.address, target.len)
+            .expect("read multi-page target after write"),
+        original
+    );
+
+    let first_after = fixture
+        .process
+        .region_at(target.address)
+        .expect("first page region query after write")
+        .expect("first page must still be inside a committed region");
+    let second_after = fixture
+        .process
+        .region_at(second_address)
+        .expect("second page region query after write")
+        .expect("second page must still be inside a committed region");
+    assert_eq!(
+        first_after.protection(),
+        first_before.protection(),
+        "the first page's original protection must be restored"
+    );
+    assert_eq!(
+        second_after.protection(),
+        second_before.protection(),
+        "the second page's original protection must be restored"
+    );
+
+    fixture.ping();
+}

@@ -207,6 +207,11 @@ impl ProcessHandle {
     /// protection change. This is therefore a plain [`ProcessHandle::write`];
     /// the scoped code-write guarantees reduce to the normal write result.
     ///
+    /// The write does not synchronize the target's instruction cache. On x86
+    /// and x86_64 the instruction and data caches are coherent; on other
+    /// architectures, including ARM64, the target may execute stale
+    /// instructions. No cache-flush operation is provided yet.
+    ///
     /// # Errors
     ///
     /// Returns [`CodeWriteError::Failed`] with [`CodeWriteFailure::Write`] for

@@ -374,6 +374,19 @@ impl Process {
     /// helper restores protection but cannot undo the bytes that were already
     /// written.
     ///
+    /// # Instruction cache
+    ///
+    /// The helper changes page protection and writes bytes, but it does not
+    /// flush the target's instruction cache: it never calls
+    /// `FlushInstructionCache` on Windows or performs an equivalent
+    /// synchronization on Linux. On x86 and x86_64, instruction and data caches
+    /// are coherent, so the write is sufficient for the supported use case. On
+    /// other architectures, including Windows and Linux on ARM64, the target
+    /// may keep executing stale instructions; callers must not assume that
+    /// patched code becomes visible. A cache-flush operation is not provided
+    /// yet. The method remains available on every supported target; only the
+    /// visibility guarantee is architecture-specific.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::ReadOnly`] for a non-empty write through a read-only
@@ -740,6 +753,24 @@ mod tests {
     #[test]
     fn process_is_send_and_sync() {
         assert_send_sync::<Process>();
+    }
+
+    // `Process::write_code` documents instruction-cache coherence only for x86
+    // and x86_64. These cfg-gated tests pin that documented architecture
+    // condition without requiring a cache flush on other targets, where the
+    // helper remains available but makes no visibility promise.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn write_code_cache_coherence_guarantee_applies_on_x86() {
+        let arch = std::hint::black_box(std::env::consts::ARCH);
+        assert!(matches!(arch, "x86" | "x86_64"), "unexpected arch {arch}");
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn write_code_cache_coherence_guarantee_does_not_apply_off_x86() {
+        let arch = std::hint::black_box(std::env::consts::ARCH);
+        assert!(!matches!(arch, "x86" | "x86_64"), "unexpected arch {arch}");
     }
 
     #[test]

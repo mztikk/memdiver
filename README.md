@@ -43,6 +43,11 @@ or real cross-process integration tests.
 | Detect target exit | yes | yes |
 | PID reuse cannot redirect access | yes | yes |
 
+`Process::write_code` is available on Linux and Windows. Its instruction-cache
+coherence guarantee is limited to x86/x86_64: on other architectures, including
+ARM64, patched code may not be observed without a cache flush, which the library
+does not provide yet.
+
 ## Design highlights
 
 * **Pinned handles.** On Linux the open handle keeps `/proc/<pid>/mem` and
@@ -285,7 +290,9 @@ with process, address, and range context.
   `i64::MAX` are rejected as invalid rather than wrapped.
 * Linux has no API for changing another process's page protections;
   `Process::protect` returns `Error::Unsupported`. `Process::write_code` still
-  works: it writes through `/proc/<pid>/mem` and skips the protection step.
+  works: it writes through `/proc/<pid>/mem` and skips the protection step. It
+  does not synchronize the target's instruction cache; the coherence guarantee
+  is limited to x86/x86_64.
 
 ### Requirements and troubleshooting (Linux)
 
@@ -338,7 +345,10 @@ cat /proc/sys/kernel/yama/ptrace_scope
   page covering the range to `PAGE_EXECUTE_READWRITE`, writes the bytes, and
   restores the page's exact original protection. If the write or a protection
   change fails, it restores everything already changed and returns the original
-  failure; if restoration also fails, the error retains both failures.
+  failure; if restoration also fails, the error retains both failures. It does
+  not call `FlushInstructionCache`; instruction/data cache coherence is only
+  guaranteed on x86/x86_64, so callers on ARM64 must not assume patched code is
+  visible.
 * Guard pages are reported through `Protection::GUARD`.
 * `wait_for_exit` uses `WaitForSingleObject` on the pinned handle.
 * PE exports are parsed from the module file and converted with
@@ -375,6 +385,11 @@ required.
 * Linux cannot change page protections.
 * Symbol resolution is limited to named module exports.
 * Reads and writes are not atomic with respect to the target's own accesses.
+* `Process::write_code` does not flush the target's instruction cache. The
+  visibility guarantee is limited to x86/x86_64, where instruction and data
+  caches are coherent. On other architectures, including ARM64, the target may
+  execute stale instructions after a patch, and no cache-flush API is provided
+  yet.
 * The library never attaches a debugger, suspends threads, or injects code.
 * Pattern and value scans are best-effort snapshots of live memory: unreadable
   regions and failed chunk reads are skipped, and there is no

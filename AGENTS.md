@@ -125,7 +125,11 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
     protection change fails, restore everything already changed and return the
     original failure; if a restore also fails, return a composite error that
     keeps both failures. A write that succeeds but cannot restore protection is
-    also an error; never return `Ok(())` with a page still modified.
+    also an error; never return `Ok(())` with a page still modified. The helper
+    does not flush the target's instruction cache. Instruction/data cache
+    coherence is guaranteed only on x86/x86_64; on other architectures,
+    including ARM64, callers must not assume patched code is visible. A
+    cache-flush operation is not provided yet.
 
 ## Unsafe code policy
 
@@ -185,7 +189,9 @@ in `memdiver-sys`.
 * Debug privileges are a Windows concept; return `Unsupported` on Linux.
 * Linux cannot change another process's page protection. `protect` must return
   `Unsupported`. `write_code` is still supported: it writes through
-  `/proc/<pid>/mem` and performs no protection step.
+  `/proc/<pid>/mem` and performs no protection step. It does not synchronize the
+  target's instruction cache; the coherence guarantee is limited to x86/x86_64
+  (no `FlushInstructionCache` equivalent is called).
 
 ### Windows
 
@@ -233,7 +239,11 @@ in `memdiver-sys`.
   round-trip (for example `PAGE_WRITECOPY` and `PAGE_GUARD`). It must restore
   every changed page even when one restore fails, and report both the original
   failure and the restore failure. Preflight the committed range and fail before
-  changing protection when a safe restore cannot be planned.
+  changing protection when a safe restore cannot be planned. The write does not
+  call `FlushInstructionCache`; visibility of patched instructions is guaranteed
+  only on x86/x86_64, where instruction and data caches are coherent. ARM64 and
+  other architectures need an explicit flush that the library does not provide
+  yet.
 * Guard pages (`PAGE_GUARD`) are reported in `Protection::GUARD`.
 * `PROCESS_VM_READ`/`WRITE` permission is checked by the OS. Protected processes
   and anti-cheat can deny access even to elevated callers.
@@ -261,6 +271,15 @@ Tests live at the lowest level that can observe the behaviour:
   address with its existing bytes so a failed restore cannot change fixture
   behaviour, and must verify the page protection is identical afterwards. Do not
   patch different instruction bytes into the running fixture.
+* Windows must also cover a multi-page range whose pages start with **different**
+  protections. The fixture's Windows-only `MULTI` target allocates two adjacent
+  pages (executable/read-only and read-only), exposes the base and page size, and
+  is kept alive for the test. The parent writes the existing bytes back and
+  checks both regions' original protections afterwards. The target is never
+  executed.
+* The instruction-cache coherence claim is x86/x86_64-only. Add a cfg-gated test
+  that pins the documented architecture condition, and never make non-x86
+  architectures fail for the absence of a guarantee.
 * Restoration-failure paths that cannot be forced deterministically through the
   OS need a unit test for the composite error construction and formatting, with
   a comment explaining why no end-to-end test forces the failure.

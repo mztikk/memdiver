@@ -27,6 +27,10 @@
 //! | Module exports | ELF module file | PE module file |
 //! | Change protection | not supported | `VirtualProtectEx` |
 //!
+//! `Process::write_code` is available on every supported target. Its
+//! instruction-cache coherence guarantee is limited to x86/x86_64; on other
+//! architectures the target may execute stale instructions after a patch.
+//!
 //! Transfers are all-or-nothing from the API's point of view: an operating
 //! system transfer that is shorter than requested produces
 //! [`Error::PartialRead`] or [`Error::PartialWrite`] rather than silently

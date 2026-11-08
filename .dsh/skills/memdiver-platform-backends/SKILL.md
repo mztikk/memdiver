@@ -46,6 +46,12 @@ failure separately; the safe layer turns that into the user-facing composite
 error. Every error must be `memdiver_sys::Error` with an `ErrorKind` and the raw
 OS code where one exists, except for the structured scoped-write outcome.
 
+`write_code` does not flush the target's instruction cache. On x86/x86_64 the
+instruction and data caches are coherent; on other architectures, including
+ARM64, callers must not assume patched code is visible and no cache-flush
+operation is provided. The API itself remains available on every supported
+target; only the visibility guarantee is architecture-specific.
+
 The pinned-instance invariants are not negotiable:
 
 * Linux: keep `/proc/<pid>` and `/proc/<pid>/mem` open, capture the start time
@@ -118,6 +124,8 @@ The pinned-instance invariants are not negotiable:
 * Linux cannot change another process's protection: return
   `ErrorKind::Unsupported`. `write_code` is still supported and is a plain
   `write` through `/proc/<pid>/mem`; no protection step is needed or possible.
+  It does not synchronize the target's instruction cache; the coherence
+  guarantee is x86/x86_64-only.
 
 ### Windows
 
@@ -144,6 +152,9 @@ The pinned-instance invariants are not negotiable:
   `PAGE_EXECUTE_WRITECOPY` into `PAGE_EXECUTE_READWRITE`. Restore all changed
   pages even when one restore fails, and preflight the committed range before
   changing anything. Use `GetSystemInfo().dwPageSize` rather than assuming 4 KiB.
+  The write does not call `FlushInstructionCache`; only x86/x86_64 gets the
+  coherent-cache visibility guarantee. ARM64 and other architectures need an
+  explicit flush that the library does not provide yet.
 * `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` is the liveness check. Do not
   use `GetExitCodeProcess == STILL_ACTIVE`; the exit code is ambiguous.
 * `wait_for_exit` uses `WaitForSingleObject` with millisecond timeouts. `None`
