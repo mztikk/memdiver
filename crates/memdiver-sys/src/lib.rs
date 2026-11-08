@@ -7,9 +7,13 @@
 //! * [`ProcessHandle`] pins one process and its memory for its entire lifetime.
 //! * Reads and writes report how many bytes the operating system transferred;
 //!   deciding whether a short transfer is an error is the caller's job.
-//! * [`ProcessHandle::write_code`] performs a scoped code write that temporarily
-//!   changes page protection and reports write and restoration failures
-//!   separately.
+//! * [`ProcessHandle::write_code`] performs a scoped code write. On Windows this
+//!   temporarily changes page protection and reports write and restoration
+//!   failures separately; on Linux it is a plain `/proc/<pid>/mem` write because
+//!   Linux has no cross-process protection change.
+//! * [`ProcessHandle::read_module_file`] reads a mapped module file in the
+//!   target's namespace, bounded to a regular file of at most
+//!   [`MAX_MODULE_FILE_SIZE`] bytes.
 //! * Errors are reported as [`Error`] values carrying an [`ErrorKind`] and the
 //!   raw operating-system error code. No platform error is flattened into a
 //!   string without keeping the code around.
@@ -31,9 +35,19 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 
 use bitflags::bitflags;
+
+/// Largest module file this crate will read for export resolution.
+///
+/// Module files are parsed from disk, so the size is bounded to keep a
+/// malicious or accidental mapping of a device, FIFO or enormous sparse file
+/// from consuming unbounded memory. A module larger than this cannot have its
+/// exports resolved.
+pub const MAX_MODULE_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -164,6 +178,12 @@ pub enum ErrorKind {
     InvalidAddress,
     /// A protection combination cannot be represented by this platform.
     InvalidProtection,
+    /// The target's address space was replaced, for example by `execve`.
+    ///
+    /// The process is still alive and its PID and start time are unchanged, but
+    /// the pinned memory descriptor refers to the previous address space. Open a
+    /// new handle to the process to access the new image.
+    AddressSpaceReplaced,
     /// The operation is not available on this platform.
     Unsupported,
     /// Data returned by the operating system could not be parsed.
@@ -338,6 +358,49 @@ pub(crate) fn io_message(code: i32) -> String {
     std::io::Error::from_raw_os_error(code).to_string()
 }
 
+/// Reads an already-opened file with a metadata and size guard.
+///
+/// The file must be a regular file no larger than `max_len` at the time of the
+/// metadata check; the subsequent read is capped at `max_len + 1` so a file
+/// that grows or a device that never ends cannot consume unbounded memory.
+/// `map` converts an I/O failure into the platform-specific [`Error`].
+pub(crate) fn read_bounded_file(
+    file: File,
+    max_len: u64,
+    map: fn(std::io::Error) -> Error,
+) -> Result<Vec<u8>, Error> {
+    let metadata = file.metadata().map_err(map)?;
+    if !metadata.is_file() {
+        return Err(Error::malformed(
+            "module path is not a regular file".to_owned(),
+        ));
+    }
+    if metadata.len() > max_len {
+        return Err(Error::malformed(format!(
+            "module file is {} bytes, larger than the {max_len}-byte limit",
+            metadata.len()
+        )));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| Error::malformed("module file size does not fit in usize".to_owned()))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            None,
+            format!("could not allocate {capacity} bytes for a module file"),
+        )
+    })?;
+    let mut limited = file.take(max_len.saturating_add(1));
+    limited.read_to_end(&mut bytes).map_err(map)?;
+    if bytes.len() as u64 > max_len {
+        return Err(Error::malformed(
+            "module file grew while it was being read".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +431,44 @@ mod tests {
         assert!((readable | writable).contains(readable));
         assert!(!readable.contains(Protection::WRITE));
         assert_eq!(Protection::all().bits(), 0b1111);
+    }
+
+    fn test_io_error(error: std::io::Error) -> Error {
+        Error::new(ErrorKind::Other, error.raw_os_error(), error.to_string())
+    }
+
+    #[test]
+    fn bounded_file_read_enforces_regular_file_and_size() {
+        let path = std::env::temp_dir().join(format!(
+            "memdiver-sys-bounded-{}-{}",
+            std::process::id(),
+            std::line!()
+        ));
+        std::fs::write(&path, b"hello").expect("write temporary file");
+
+        let error = read_bounded_file(
+            File::open(&path).expect("open temporary file"),
+            4,
+            test_io_error,
+        )
+        .expect_err("a five-byte file must exceed a four-byte limit");
+        assert_eq!(error.kind(), ErrorKind::MalformedData);
+
+        let bytes = read_bounded_file(
+            File::open(&path).expect("open temporary file"),
+            5,
+            test_io_error,
+        )
+        .expect("exactly the size limit must be accepted");
+        assert_eq!(bytes, b"hello");
+        let _ = std::fs::remove_file(&path);
+
+        #[cfg(unix)]
+        {
+            let device = File::open("/dev/zero").expect("open /dev/zero");
+            let error = read_bounded_file(device, 16, test_io_error)
+                .expect_err("/dev/zero is not a regular file");
+            assert_eq!(error.kind(), ErrorKind::MalformedData);
+        }
     }
 }

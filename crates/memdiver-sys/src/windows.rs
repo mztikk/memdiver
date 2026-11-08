@@ -6,9 +6,11 @@
 //! Every operation, including module enumeration, goes through that handle, so
 //! PID reuse cannot redirect a query to a different process.
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fmt;
+use std::fs::File;
 use std::mem::{size_of, zeroed};
+use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::Duration;
@@ -36,12 +38,15 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::ProcessStatus::{
     EnumProcessModulesEx, GetModuleFileNameExW, GetModuleInformation, LIST_MODULES_ALL, MODULEINFO,
 };
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+use windows_sys::Win32::System::SystemInformation::{
+    GetSystemInfo, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT,
+    IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN, SYSTEM_INFO,
+};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-    QueryFullProcessImageNameW, WaitForSingleObject,
+    GetCurrentProcess, IsWow64Process, IsWow64Process2, OpenProcess, OpenProcessToken,
+    PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+    PROCESS_VM_WRITE, QueryFullProcessImageNameW, WaitForSingleObject,
 };
 
 use crate::{
@@ -141,35 +146,56 @@ impl ProcessHandle {
 
     /// Returns the pointer width of the target process.
     ///
-    /// A 32-bit WOW64 process is reported as [`PointerWidth::Bits32`]; otherwise
-    /// the width follows the bitness of the current host process.
+    /// A 32-bit process (including x86-on-x64 and ARM32-on-ARM64) is reported
+    /// as [`PointerWidth::Bits32`]; 64-bit targets are [`PointerWidth::Bits64`].
+    /// `IsWow64Process2` supplies the machine pair, with `IsWow64Process` as
+    /// the fallback on older systems.
     ///
     /// # Errors
     ///
-    /// Returns an error when `IsWow64Process` fails.
+    /// Returns an error when the Win32 query fails.
     pub fn pointer_width(&self) -> Result<PointerWidth, Error> {
+        let mut process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+        let mut native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+        // SAFETY: the handle is owned by `self` and both output parameters are
+        // writable for one machine value.
+        let succeeded = unsafe {
+            IsWow64Process2(
+                self.handle.as_handle(),
+                &mut process_machine,
+                &mut native_machine,
+            )
+        };
+        if succeeded != 0 {
+            return Ok(pointer_width_from_machines(process_machine, native_machine));
+        }
+
+        // Fall back for older systems where IsWow64Process2 is unavailable.
         let mut wow64 = 0i32;
         // SAFETY: the handle is owned by `self` and `wow64` is writable.
         let succeeded = unsafe { IsWow64Process(self.handle.as_handle(), &mut wow64) };
         if succeeded == 0 {
             return Err(last_error());
         }
-        if wow64 != 0 || cfg!(target_pointer_width = "32") {
-            Ok(PointerWidth::Bits32)
+        Ok(if wow64 != 0 || cfg!(target_pointer_width = "32") {
+            PointerWidth::Bits32
         } else {
-            Ok(PointerWidth::Bits64)
-        }
+            PointerWidth::Bits64
+        })
     }
 
     /// Returns the executable path recorded by the operating system, when
     /// available.
     ///
+    /// An empty path is reported as `None`; a failed query on the live pinned
+    /// handle is an error so callers can distinguish "unavailable" from a
+    /// verification failure.
+    ///
     /// # Errors
     ///
-    /// This backend currently reports an unavailable path as `None` rather than
-    /// an error; the result type leaves room for future diagnostics.
+    /// Returns the Win32 error when `QueryFullProcessImageNameW` fails.
     pub fn exe_path(&self) -> Result<Option<PathBuf>, Error> {
-        Ok(query_image_path(self.handle.as_handle()))
+        query_image_path(self.handle.as_handle())
     }
 
     /// Reads up to `buffer.len()` bytes starting at `address`.
@@ -475,21 +501,14 @@ impl ProcessHandle {
     /// Waits for the process to exit.
     ///
     /// Returns `true` when the process exited and `false` when the timeout
-    /// expired first. `None` waits indefinitely. Timeouts longer than roughly
-    /// 49 days are capped by the Win32 millisecond timeout.
+    /// expired first. `None` waits indefinitely. Every finite timeout is capped
+    /// at `u32::MAX - 1` milliseconds so it never becomes Win32's `INFINITE`.
     ///
     /// # Errors
     ///
     /// Returns an error when `WaitForSingleObject` fails.
     pub fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<bool, Error> {
-        let millis = timeout.map_or(u32::MAX, |timeout| {
-            let millis = timeout.as_millis();
-            if millis == 0 {
-                0
-            } else {
-                u32::try_from(millis).unwrap_or(u32::MAX - 1)
-            }
-        });
+        let millis = timeout_millis(timeout);
         // SAFETY: the handle is owned by `self` and valid for the call.
         let result = unsafe { WaitForSingleObject(self.handle.as_handle(), millis) };
         match result {
@@ -512,8 +531,29 @@ impl ProcessHandle {
     /// fails immediately, or when `VirtualQueryEx` fails before the address
     /// space is exhausted.
     pub fn regions(&self) -> Result<Vec<RawRegion>, Error> {
+        self.regions_with_paths(true)
+    }
+
+    /// Enumerates committed regions without resolving module paths.
+    ///
+    /// Range scans only need protection and range information; skipping the
+    /// module list avoids a full module enumeration (and the per-module path
+    /// queries) on every scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ProcessHandle::regions`].
+    pub fn regions_without_paths(&self) -> Result<Vec<RawRegion>, Error> {
+        self.regions_with_paths(false)
+    }
+
+    fn regions_with_paths(&self, fill_paths: bool) -> Result<Vec<RawRegion>, Error> {
         self.ensure_alive()?;
-        let modules = self.modules().unwrap_or_default();
+        let modules = if fill_paths {
+            self.modules().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut regions = Vec::new();
         let mut address = 0usize;
 
@@ -548,7 +588,9 @@ impl ProcessHandle {
             let base = info.BaseAddress as usize;
             let size = info.RegionSize;
             if size == 0 {
-                break;
+                return Err(Error::malformed(
+                    "VirtualQueryEx returned a zero-sized region".to_owned(),
+                ));
             }
             let next = base
                 .checked_add(size)
@@ -562,10 +604,16 @@ impl ProcessHandle {
                     MEM_MAPPED => RegionKind::Mapped,
                     _ => RegionKind::Private,
                 };
-                let path = modules
-                    .iter()
-                    .find(|module| module_contains(module, base64))
-                    .map(|module| module.path.clone());
+                let path = if fill_paths {
+                    let index = modules.partition_point(|module| module.base <= base64);
+                    index
+                        .checked_sub(1)
+                        .and_then(|index| modules.get(index))
+                        .filter(|module| module_contains(module, base64))
+                        .map(|module| module.path.clone())
+                } else {
+                    None
+                };
                 regions.push(RawRegion {
                     base: base64,
                     size: size as u64,
@@ -616,6 +664,33 @@ impl ProcessHandle {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Reads a mapped module file and returns its bytes.
+    ///
+    /// The module must still be present in the pinned process's module list at
+    /// `base` with the same path. The file must be a regular file no larger
+    /// than [`MAX_MODULE_FILE_SIZE`](crate::MAX_MODULE_FILE_SIZE); this rejects
+    /// devices, FIFOs and enormous files before parsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::MalformedData`] when the module is no longer
+    /// present or the path is not a bounded regular file, and the underlying
+    /// operating-system error when the file cannot be opened or read.
+    pub fn read_module_file(&self, base: u64, path: &Path) -> Result<Vec<u8>, Error> {
+        let modules = self.modules()?;
+        let present = modules
+            .iter()
+            .any(|module| module.base == base && module.path == path);
+        if !present {
+            return Err(Error::malformed(format!(
+                "module mapping for {} is no longer present",
+                path.display()
+            )));
+        }
+        let file = File::open(path).map_err(io_error)?;
+        crate::read_bounded_file(file, crate::MAX_MODULE_FILE_SIZE, io_error)
     }
 
     /// Changes the protection of a memory range.
@@ -694,6 +769,7 @@ impl ProcessHandle {
         }
 
         let mut capacity = required;
+        let mut path_buffer = vec![0u16; 32_768];
         for _ in 0..MAX_MODULE_ATTEMPTS {
             let slots = (capacity as usize / size_of::<HMODULE>()).max(1);
             let mut buffer = vec![ptr::null_mut(); slots];
@@ -721,7 +797,7 @@ impl ProcessHandle {
 
             let mut modules = Vec::with_capacity(buffer.len());
             for module in buffer {
-                modules.push(self.module_from_handle(module)?);
+                modules.push(self.module_from_handle(module, &mut path_buffer)?);
             }
             modules.sort_by(|left, right| {
                 left.base
@@ -738,7 +814,11 @@ impl ProcessHandle {
         ))
     }
 
-    fn module_from_handle(&self, module: HMODULE) -> Result<RawModule, Error> {
+    fn module_from_handle(
+        &self,
+        module: HMODULE,
+        path_buffer: &mut [u16],
+    ) -> Result<RawModule, Error> {
         // SAFETY: MODULEINFO is plain-old-data and zero is a valid initial
         // value. The handle and module handle come from the same live process.
         let mut info: MODULEINFO = unsafe { zeroed() };
@@ -753,10 +833,9 @@ impl ProcessHandle {
             )
         };
         if succeeded == 0 {
-            return Err(last_error());
+            return Err(module_error(last_error_code()));
         }
 
-        let mut path_buffer = vec![0u16; 32_768];
         // SAFETY: the process and module handles are valid; the buffer is
         // writable for `path_buffer.len()` UTF-16 code units.
         let length = unsafe {
@@ -772,7 +851,7 @@ impl ProcessHandle {
             return Err(if code == 0 {
                 Error::malformed("GetModuleFileNameExW returned an empty module path")
             } else {
-                win_error(code)
+                module_error(code)
             });
         }
         if length as usize >= path_buffer.len() {
@@ -780,8 +859,7 @@ impl ProcessHandle {
                 "GetModuleFileNameExW truncated a module path longer than 32767 UTF-16 code units",
             ));
         }
-        path_buffer.truncate(length as usize);
-        let path = PathBuf::from(wide_to_string(&path_buffer));
+        let path = PathBuf::from(wide_to_os_string(&path_buffer[..length as usize]));
 
         Ok(RawModule {
             name: file_name(&path),
@@ -852,11 +930,12 @@ fn process_snapshot() -> Result<Vec<RawProcessInfo>, Error> {
     }
 
     let mut processes = Vec::new();
+    let mut path_buffer = vec![0u16; 32_768];
     loop {
         let pid = entry.th32ProcessID;
         if pid != 0 {
             let name = wide_to_string(&entry.szExeFile);
-            let exe_path = limited_image_path(pid);
+            let exe_path = limited_image_path(pid, &mut path_buffer);
             if !name.is_empty() || exe_path.is_some() {
                 let name = if name.is_empty() {
                     exe_path.as_deref().map(file_name).unwrap_or_default()
@@ -888,29 +967,47 @@ fn process_snapshot() -> Result<Vec<RawProcessInfo>, Error> {
     Ok(processes)
 }
 
-fn limited_image_path(pid: u32) -> Option<PathBuf> {
+fn limited_image_path(pid: u32, buffer: &mut [u16]) -> Option<PathBuf> {
     // SAFETY: OpenProcess has no pointer preconditions.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return None;
     }
     let handle = OwnedHandle::new(handle);
-    query_image_path(handle.as_handle())
+    query_image_path_with_buffer(handle.as_handle(), buffer)
+        .ok()
+        .flatten()
 }
 
-fn query_image_path(handle: HANDLE) -> Option<PathBuf> {
+fn query_image_path(handle: HANDLE) -> Result<Option<PathBuf>, Error> {
     let mut buffer = vec![0u16; 32_768];
+    query_image_path_with_buffer(handle, &mut buffer)
+}
+
+fn query_image_path_with_buffer(
+    handle: HANDLE,
+    buffer: &mut [u16],
+) -> Result<Option<PathBuf>, Error> {
     let mut length = buffer.len() as u32;
     // SAFETY: the handle was opened for query access, the buffer is writable
     // for `length` UTF-16 units, and `length` is a valid in/out size.
     let succeeded = unsafe {
         QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length)
     };
-    if succeeded == 0 || length == 0 || length as usize >= buffer.len() {
-        return None;
+    if succeeded == 0 {
+        return Err(last_error());
     }
-    buffer.truncate(length as usize);
-    Some(PathBuf::from(wide_to_string(&buffer)))
+    if length == 0 {
+        return Ok(None);
+    }
+    if length as usize >= buffer.len() {
+        return Err(Error::malformed(
+            "QueryFullProcessImageNameW returned an unterminated path".to_owned(),
+        ));
+    }
+    Ok(Some(PathBuf::from(wide_to_os_string(
+        &buffer[..length as usize],
+    ))))
 }
 
 /// Enables the current process's `SeDebugPrivilege`.
@@ -990,7 +1087,22 @@ fn is_retryable_module_error(error: &Error) -> bool {
         Some(code)
             if code == ERROR_PARTIAL_COPY as i32
                 || code == ERROR_INSUFFICIENT_BUFFER as i32
+                // A module unloaded between the snapshot and the per-module
+                // query; the process handle itself is still valid.
+                || code == ERROR_INVALID_HANDLE as i32
     )
+}
+
+/// Maps a per-module query failure.
+///
+/// `ERROR_INVALID_HANDLE` from `GetModuleInformation`/`GetModuleFileNameExW`
+/// means the module disappeared, not that the process exited.
+fn module_error(code: u32) -> Error {
+    if code == ERROR_INVALID_HANDLE {
+        win_error_with_kind(code, ErrorKind::NotFound)
+    } else {
+        win_error(code)
+    }
 }
 
 fn file_name(path: &Path) -> String {
@@ -1002,6 +1114,18 @@ fn file_name(path: &Path) -> String {
 
 fn module_contains(module: &RawModule, address: u64) -> bool {
     address >= module.base && address - module.base < module.size
+}
+
+/// Converts a UTF-16 buffer to an `OsString` without lossy replacement.
+///
+/// Windows paths can contain unpaired surrogates; keeping them as WTF-16 lets
+/// `PathBuf` name the actual file instead of a replacement-character path.
+fn wide_to_os_string(wide: &[u16]) -> OsString {
+    let end = wide
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(wide.len());
+    OsString::from_wide(&wide[..end])
 }
 
 fn wide_to_string(wide: &[u16]) -> String {
@@ -1044,6 +1168,47 @@ fn system_page_size() -> Result<usize, CodeWriteError> {
         }));
     }
     Ok(page_size)
+}
+
+/// Maps the machine types reported by `IsWow64Process2` to a pointer width.
+///
+/// `IsWow64Process` cannot recognize 32-bit ARM processes on ARM64 Windows, so
+/// the machine pair is authoritative here. A 64-bit process may report
+/// `IMAGE_FILE_MACHINE_UNKNOWN`; its width then follows the native machine.
+fn pointer_width_from_machines(process_machine: u16, native_machine: u16) -> PointerWidth {
+    match process_machine {
+        IMAGE_FILE_MACHINE_I386 | IMAGE_FILE_MACHINE_ARMNT => PointerWidth::Bits32,
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 => PointerWidth::Bits64,
+        IMAGE_FILE_MACHINE_UNKNOWN => match native_machine {
+            IMAGE_FILE_MACHINE_I386 => PointerWidth::Bits32,
+            _ => PointerWidth::Bits64,
+        },
+        _ => {
+            if cfg!(target_pointer_width = "32") {
+                PointerWidth::Bits32
+            } else {
+                PointerWidth::Bits64
+            }
+        }
+    }
+}
+
+/// Converts a timeout to the millisecond value expected by
+/// `WaitForSingleObject`.
+///
+/// `None` is `INFINITE`. Every finite timeout is capped at `u32::MAX - 1`; the
+/// value `u32::MAX` is `INFINITE`, so it must never be used for a finite wait
+/// (a caller asking for exactly 4_294_967_295 ms must still time out).
+fn timeout_millis(timeout: Option<Duration>) -> u32 {
+    match timeout {
+        None => u32::MAX,
+        Some(timeout) => {
+            let millis = timeout.as_millis();
+            u32::try_from(millis)
+                .unwrap_or(u32::MAX - 1)
+                .min(u32::MAX - 1)
+        }
+    }
 }
 
 fn page_to_protection(page: PAGE_PROTECTION_FLAGS) -> Protection {
@@ -1092,6 +1257,11 @@ fn protection_to_page(protection: Protection) -> Option<PAGE_PROTECTION_FLAGS> {
         (false, true, false) | (false, true, true) => return None,
     };
     if protection.is_guarded() {
+        // Windows rejects PAGE_NOACCESS | PAGE_GUARD; a guard page needs an
+        // access right to guard.
+        if page == PAGE_NOACCESS {
+            return None;
+        }
         page |= PAGE_GUARD;
     }
     Some(page)
@@ -1104,6 +1274,13 @@ fn last_error_code() -> u32 {
 
 fn last_error() -> Error {
     win_error(last_error_code())
+}
+
+fn io_error(error: std::io::Error) -> Error {
+    match error.raw_os_error() {
+        Some(code) => win_error(code as u32),
+        None => Error::new(ErrorKind::Other, None, error.to_string()),
+    }
 }
 
 fn win_error(code: u32) -> Error {
@@ -1152,6 +1329,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preserves_unpaired_surrogates_in_paths() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let os = wide_to_os_string(&[0xD800, 0]);
+        assert_eq!(os.encode_wide().collect::<Vec<_>>(), vec![0xD800]);
+    }
+
+    #[test]
     fn converts_wide_strings() {
         assert_eq!(
             wide_to_string(&[b'a' as u16, b'b' as u16, 0, b'x' as u16]),
@@ -1164,6 +1349,59 @@ mod tests {
         let mut utf16: Vec<u16> = emoji.encode_utf16().collect();
         utf16.push(0);
         assert_eq!(wide_to_string(&utf16), emoji);
+    }
+
+    #[test]
+    fn finite_timeouts_never_become_infinite() {
+        assert_eq!(timeout_millis(None), u32::MAX);
+        assert_eq!(timeout_millis(Some(Duration::ZERO)), 0);
+        assert_eq!(timeout_millis(Some(Duration::from_millis(1))), 1);
+        assert_eq!(
+            timeout_millis(Some(Duration::from_millis(u64::from(u32::MAX - 1)))),
+            u32::MAX - 1
+        );
+        assert_eq!(
+            timeout_millis(Some(Duration::from_millis(u64::from(u32::MAX)))),
+            u32::MAX - 1
+        );
+        assert_eq!(timeout_millis(Some(Duration::MAX)), u32::MAX - 1);
+    }
+
+    #[test]
+    fn module_unload_is_retryable_and_not_process_exit() {
+        let error = module_error(ERROR_INVALID_HANDLE);
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(error.raw_code(), Some(ERROR_INVALID_HANDLE as i32));
+        assert!(is_retryable_module_error(&error));
+        assert!(!is_retryable_process_error(&error));
+    }
+
+    #[test]
+    fn maps_machine_types_to_pointer_width() {
+        assert_eq!(
+            pointer_width_from_machines(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64),
+            PointerWidth::Bits32
+        );
+        assert_eq!(
+            pointer_width_from_machines(IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_ARM64),
+            PointerWidth::Bits32
+        );
+        assert_eq!(
+            pointer_width_from_machines(IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_AMD64),
+            PointerWidth::Bits64
+        );
+        assert_eq!(
+            pointer_width_from_machines(IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARM64),
+            PointerWidth::Bits64
+        );
+        assert_eq!(
+            pointer_width_from_machines(IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_ARM64),
+            PointerWidth::Bits64
+        );
+        assert_eq!(
+            pointer_width_from_machines(IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_I386),
+            PointerWidth::Bits32
+        );
     }
 
     #[test]
@@ -1191,6 +1429,18 @@ mod tests {
             page_to_protection(PAGE_EXECUTE_WRITECOPY),
             Protection::READ | Protection::WRITE | Protection::EXECUTE
         );
+        assert_eq!(
+            page_to_protection(PAGE_WRITECOPY),
+            Protection::READ | Protection::WRITE
+        );
+        assert_eq!(
+            page_to_protection(PAGE_NOACCESS | PAGE_GUARD),
+            Protection::GUARD
+        );
+        assert_eq!(
+            page_to_protection(PAGE_WRITECOPY | PAGE_GUARD),
+            Protection::READ | Protection::WRITE | Protection::GUARD
+        );
     }
 
     #[test]
@@ -1213,6 +1463,11 @@ mod tests {
         assert_eq!(
             protection_to_page(Protection::WRITE | Protection::EXECUTE),
             None
+        );
+        assert_eq!(protection_to_page(Protection::GUARD), None);
+        assert_eq!(
+            protection_to_page(Protection::GUARD | Protection::READ),
+            Some(PAGE_READONLY | PAGE_GUARD)
         );
         assert_eq!(protection_to_page(Protection::from_bits_retain(0x80)), None);
     }

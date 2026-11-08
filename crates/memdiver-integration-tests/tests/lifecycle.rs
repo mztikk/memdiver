@@ -3,6 +3,9 @@
 
 mod common;
 
+use std::thread;
+use std::time::{Duration, Instant};
+
 use common::Fixture;
 use memdiver::{Error, Process};
 
@@ -47,6 +50,28 @@ fn handle_reflects_the_process_lifecycle() {
     assert!(
         matches!(error, Error::Write { .. } | Error::PartialWrite { .. }),
         "unexpected {error:?}"
+    );
+}
+
+#[test]
+fn an_exited_fixture_is_not_alive_and_wait_reports_exit() {
+    let mut fixture = Fixture::spawn();
+    fixture.exit();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.process.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not become not-alive"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!fixture.process.is_alive());
+    assert!(
+        fixture
+            .process
+            .wait_for_exit(Some(Duration::from_secs(1)))
+            .expect("wait on an exited fixture"),
+        "an exited process must report exit"
     );
 }
 

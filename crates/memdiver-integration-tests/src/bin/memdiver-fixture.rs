@@ -13,6 +13,10 @@
 //! * `CODE` → `CODE <address> <length>` for the executable code target
 //! * `MULTI` (Windows only) → `MULTI <address> <length> <page_size>` for the
 //!   two-page allocation with differing protections
+//! * `ZERO` (Linux only) → `ZERO <address>` for an executable `/dev/zero`
+//!   mapping used to test device-backed module rejection
+//! * `EXEC` (Linux only) — replaces the fixture image with itself; the parent's
+//!   pinned memory descriptor becomes stale
 //! * `EXIT` → the fixture exits
 //!
 //! Invalid commands or ranges produce `ERR`.
@@ -49,6 +53,34 @@ struct MultiPageTarget {
     base: *mut std::ffi::c_void,
     len: usize,
     page_size: usize,
+}
+
+/// A Linux-only executable mapping of `/dev/zero`.
+///
+/// The mapping exists so the parent can prove that a device-backed "module" is
+/// rejected before its file is read (reading `/dev/zero` would never finish).
+#[cfg(target_os = "linux")]
+fn zero_target() -> u64 {
+    // SAFETY: `open` has no pointer preconditions; the returned descriptor is
+    // checked and closed after `mmap` has duplicated the mapping.
+    let fd = unsafe { libc::open(c"/dev/zero".as_ptr(), libc::O_RDONLY) };
+    assert!(fd >= 0, "open /dev/zero");
+    // SAFETY: a null address lets the kernel choose a page-aligned range. The
+    // resulting pointer is checked and owns `len` mapped bytes.
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        )
+    };
+    // SAFETY: the descriptor was opened above and is no longer needed.
+    unsafe { libc::close(fd) };
+    assert!(address != libc::MAP_FAILED, "mmap /dev/zero");
+    address as usize as u64
 }
 
 #[cfg(windows)]
@@ -154,6 +186,10 @@ fn main() -> io::Result<()> {
     let code_address = code_target as *const () as usize;
     #[cfg(windows)]
     let multi_page = multi_page_target();
+    #[cfg(target_os = "linux")]
+    let zero_address = zero_target();
+    #[cfg(target_os = "linux")]
+    std::hint::black_box(zero_address);
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -179,6 +215,8 @@ fn main() -> io::Result<()> {
                 "MULTI {} {} {}",
                 multi_page.base as usize, multi_page.len, multi_page.page_size
             )?,
+            #[cfg(target_os = "linux")]
+            Some("ZERO") => writeln!(output, "ZERO {zero_address}")?,
             Some("PEEK") => {
                 let offset = fields.next().and_then(|value| value.parse::<usize>().ok());
                 let len = fields.next().and_then(|value| value.parse::<usize>().ok());
@@ -194,6 +232,20 @@ fn main() -> io::Result<()> {
                     }
                     _ => writeln!(output, "ERR")?,
                 }
+            }
+            #[cfg(target_os = "linux")]
+            Some("EXEC") => {
+                use std::ffi::CString;
+                use std::os::unix::ffi::OsStrExt;
+
+                let exe = std::env::current_exe().expect("current fixture executable");
+                let path = CString::new(exe.as_os_str().as_bytes())
+                    .expect("fixture path must not contain NUL");
+                let argv = [path.as_ptr(), std::ptr::null()];
+                // SAFETY: `path` is a valid NUL-terminated path and `argv` is a
+                // NULL-terminated argument vector. On success this never returns.
+                unsafe { libc::execv(path.as_ptr(), argv.as_ptr()) };
+                writeln!(output, "ERR")?;
             }
             Some("EXIT") => break,
             Some(_) | None => writeln!(output, "ERR")?,

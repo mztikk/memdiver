@@ -43,10 +43,14 @@ fn find_pattern_enumerates_all_modules() {
     let in_module = fixture
         .process
         .find_pattern_in_module(&fixture_name(), &pattern)
-        .expect("scan module");
-    assert!(
-        in_module.is_some(),
-        "fixture signature must be in its module"
+        .expect("scan module")
+        .expect("fixture signature must be in its module");
+    assert_eq!(
+        fixture
+            .process
+            .read_bytes(in_module, MODULE_SIGNATURE.len())
+            .expect("read module hit"),
+        MODULE_SIGNATURE
     );
 
     let error = fixture
@@ -152,6 +156,42 @@ fn alignment_and_result_limit_are_applied() {
         .find_patterns(&pattern, &ScanOptions::new().with_max_results(2))
         .expect("limited scan");
     assert_eq!(limited.len(), 2);
+}
+
+#[test]
+fn result_limit_is_enforced() {
+    let fixture = Fixture::spawn();
+    let bytes = [
+        0x5A, 0xC3, 0x19, 0xE7, 0x42, 0x88, 0x2D, 0xF1, 0x66, 0x0B, 0x94, 0x7C,
+    ];
+    let pattern = pattern_for(&bytes);
+    let base = fixture.address.get();
+    for offset in [0x100u64, 0x300, 0x500] {
+        fixture
+            .process
+            .write(Address::new(base + offset), &bytes)
+            .expect("write pattern occurrence");
+    }
+
+    let limited = fixture
+        .process
+        .find_patterns(&pattern, &ScanOptions::new().with_max_results(2))
+        .expect("limited scan");
+    assert_eq!(
+        limited.len(),
+        2,
+        "the scan must stop at max_results even with more matches: {limited:?}"
+    );
+    assert!(limited[0] < limited[1]);
+
+    let unlimited = fixture
+        .process
+        .find_patterns(&pattern, &ScanOptions::new().with_max_results(0))
+        .expect("unlimited scan");
+    assert!(
+        unlimited.len() >= 3,
+        "all three occurrences must be found: {unlimited:?}"
+    );
 }
 
 #[test]

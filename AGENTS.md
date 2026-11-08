@@ -61,7 +61,10 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
 1. **Pin the process instance.** Linux keeps the `/proc/<pid>` directory and
    `/proc/<pid>/mem` descriptors plus the start time from `/proc/<pid>/stat`.
    Windows keeps the kernel `HANDLE`. Never replace a pinned operation with a
-   fresh PID lookup. PID reuse must be harmless.
+   fresh PID lookup. PID reuse must be harmless. A Linux `execve` keeps the PID
+   and start time but replaces the address space; detect the resulting
+   zero-byte transfers and return `AddressSpaceReplaced` (or resync), never a
+   silent `PartialRead` or empty scan.
 2. **No panics on untrusted input.** Library paths return `Result`. Panics are
    reserved for impossible internal invariants and documented public-contract
    violations. Test malformed procfs data, bad addresses, and overflow.
@@ -91,14 +94,16 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
 11. **Name-based opening is unambiguous.** `open_by_name` must never silently
     pick one of several matches; return the candidate list. Verify the opened
     image name after opening and retry a bounded number of times when the
-    matching process is replaced.
+    matching process is replaced. An image name that cannot be read is *not* a
+    match; never return an unverified handle.
 12. **Scans are best-effort and bounded.** Pattern scans skip unreadable,
     guard, and failed-read chunks, protect against unbounded result vectors with
     `ScanOptions::max_results`, and overlap chunks so patterns spanning a chunk
     boundary are still found. `find_pattern` searches modules; `find_patterns`
     searches all readable memory; value scans use the same machinery with the
     value's exact native bytes. Document the difference and reject zero-sized
-    values.
+    values. A replaced address space or an exited process aborts the scan
+    instead of being treated as "not found".
 13. **Batched operations identify the entry.** `read_many` / `write_many`
     execute sequentially and an error names the zero-based entry index, the
     range, and the full underlying `Error` as its source. A read-only handle
@@ -110,10 +115,14 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
 15. **Privilege changes are opt-in.** Never enable `SeDebugPrivilege`
     automatically. It is a separate function; on Linux it returns `Unsupported`.
 16. **Exports reflect a module file, not patched memory.** Parse PE/ELF with
-    `goblin` from the module path reported by the OS; document deleted/replaced
-    files, PE forwarders, ordinal-only exports, and ELF section-header
-    requirements. Rebase with the live module base and ELF type; bound every
-    result to the live module range.
+    `goblin` from the module path reported by the OS. On Linux resolve that path
+    through `/proc/<pid>/root` and check the inode; read only a regular file
+    bounded by `MAX_MODULE_FILE_SIZE` (devices, FIFOs, oversized files and
+    replaced files are errors). Document deleted/replaced files, PE forwarders,
+    ordinal-only exports, and that ELF symbol-version information needs version
+    sections. Prefer the default symbol version over compatibility versions.
+    Rebase with the live module base and ELF type; bound every result to the live
+    module range.
 17. **No logging or printing from library code.** Callers decide how to report
     failures. Examples and the fixture may print.
 18. **Scoped code writes restore protection.** `write_code` is the supported
@@ -162,13 +171,19 @@ in `memdiver-sys`.
   spaces, `)` and other punctuation. Split after the **last** `)`.
 * The start time is field 22 (token index 18 after the state field). Verify
   against `/proc` whenever changing the parser.
-* A module is the union of all mappings of one file that has at least one
-  executable segment. Module base is the lowest mapping address; size spans all
-  of its mappings. Do not treat every `mmap`ed data file as a module.
+* A module is the union of all mappings of one file `(device, inode)` that has
+  at least one executable segment. Module base is the lowest mapping address;
+  size spans all of its mappings. Distinct files with the same path (a deleted
+  mapping and its replacement) are separate modules. Do not treat every
+  `mmap`ed data file as a module.
 * Special mappings (`[heap]`, `[stack]`, `[vdso]`, ...) have no file path and
   are `RegionKind::Private`.
 * `pread`/`pwrite` can return `EINTR`; retry. A short transfer is surfaced, not
-  looped over silently.
+  looped over silently. `/proc/<pid>/mem` reports an unmapped address as `EIO`;
+  classify that as `InvalidAddress`, not a generic I/O error.
+* A target `execve` keeps the PID and start time but replaces the address
+  space. The pinned `mem` descriptor then returns zero bytes for every read;
+  `AddressSpaceReplaced` is the defined error, and scans must propagate it.
 * Opening `/proc/<pid>/mem` goes through the ptrace access check; failures are
   usually `AccessDenied`. `kernel.yama.ptrace_scope` and container capabilities
   are documented in the README.
@@ -182,10 +197,13 @@ in `memdiver-sys`.
   unavailable or denied, it polls `/proc/<pid>/stat` (10 ms) and uses the
   captured start time so a reused PID is not reported as exit. There is no exit
   code for non-child processes.
-* ELF exports are parsed by `goblin` from the module file. Include defined
-  global/weak dynamic symbols with default/protected visibility and function,
-  object, or GNU IFUNC type. `ET_DYN` addresses are `module base + st_value`;
-  `ET_EXEC` addresses are absolute. Skip symbols outside the live module range.
+* ELF exports are parsed by `goblin` from the module file, opened through
+  `/proc/<pid>/root` with an inode check and a bounded regular-file read.
+  Include defined global/weak dynamic symbols with default/protected visibility
+  and function, object, or GNU IFUNC type; prefer the default (non-hidden)
+  version when a name has several. `ET_DYN` addresses are
+  `module base + st_value`; `ET_EXEC` addresses are absolute. Skip symbols
+  outside the live module range.
 * Debug privileges are a Windows concept; return `Unsupported` on Linux.
 * Linux cannot change another process's page protection. `protect` must return
   `Unsupported`. `write_code` is still supported: it writes through
@@ -209,8 +227,9 @@ in `memdiver-sys`.
 * During process enumeration, image paths and metadata may be queried with a
   short-lived `PROCESS_QUERY_LIMITED_INFORMATION` handle; failures mean `None`,
   not a failed enumeration. Match names ASCII case-insensitively.
-* Pointer width comes from `IsWow64Process`; a WOW64 target is 32-bit, otherwise
-  fall back to host pointer width.
+* Pointer width comes from `IsWow64Process2` (machine pair, so 32-bit ARM on
+  ARM64 is recognized), with `IsWow64Process` plus host width as the fallback
+  on older systems.
 * `wait_for_exit` uses `WaitForSingleObject` with millisecond timeouts; extremely
   long durations are capped by the Win32 range.
 * `enable_debug_privilege` opens the current process token, looks up
@@ -220,8 +239,9 @@ in `memdiver-sys`.
   non-forwarded exports and rebase by `live module base + RVA`; validate the
   result stays inside the live image.
 * Module enumeration can race with module load/unload. Retry a bounded number
-  of times on `ERROR_PARTIAL_COPY` / `ERROR_INSUFFICIENT_BUFFER`; never loop
-  forever.
+  of times on `ERROR_PARTIAL_COPY` / `ERROR_INSUFFICIENT_BUFFER` /
+  `ERROR_INVALID_HANDLE`; `ERROR_INVALID_HANDLE` from a per-module query means
+  the module vanished, not that the process exited. Never loop forever.
 * `VirtualQueryEx` iterates committed, reserved, and free ranges. Only report
   `MEM_COMMIT` regions. Reaching the end of the address space is signalled by
   `ERROR_INVALID_PARAMETER`; do not treat that as a generic failure, and do not

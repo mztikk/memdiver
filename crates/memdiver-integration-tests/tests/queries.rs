@@ -192,6 +192,15 @@ fn protection_can_be_changed_and_restored_on_windows() {
         "unexpected {error:?}"
     );
 
+    let error = fixture
+        .process
+        .protect(page, page_len, Protection::WRITE | Protection::EXECUTE)
+        .expect_err("write+execute without read is not representable");
+    assert!(
+        matches!(error, Error::InvalidProtection { .. }),
+        "unexpected {error:?}"
+    );
+
     let previous = fixture
         .process
         .protect(page, page_len, Protection::READ)
@@ -211,5 +220,15 @@ fn protection_can_be_changed_and_restored_on_windows() {
         .protect(page, page_len, previous)
         .expect("restore protection");
     assert!(restored.is_readable());
+    let after = fixture
+        .process
+        .region_at(fixture.address)
+        .expect("region query after restore")
+        .expect("buffer region after restore");
+    assert_eq!(
+        after.protection(),
+        previous,
+        "the restore call must leave the page with its original protection"
+    );
     assert!(fixture.process.read_bytes(fixture.address, 16).is_ok());
 }

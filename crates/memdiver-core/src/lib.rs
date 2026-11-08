@@ -20,7 +20,7 @@
 //! | Modules | executable file mappings from `/proc/<pid>/maps` | `EnumProcessModulesEx` |
 //! | Pattern scanning | chunked readable-memory reads | chunked readable-memory reads |
 //! | Typed value scanning / batch I/O | yes | yes |
-//! | Pointer width / chains | ELF class / implicit | `IsWow64Process` / checked pointers |
+//! | Pointer width / chains | ELF class / implicit | `IsWow64Process2` (fallback `IsWow64Process`) / checked pointers |
 //! | Strings | C and UTF-16LE helpers | C and UTF-16LE helpers |
 //! | Wait for exit | pidfd `poll` (polling fallback) | `WaitForSingleObject` |
 //! | Enable debug privilege | not supported | `SeDebugPrivilege` helper |
@@ -81,12 +81,12 @@ mod wait;
 pub use address::Address;
 pub use error::{Error, Result};
 pub use exports::Export;
-pub use module::Module;
+pub use module::{Module, ModuleMap};
 pub use pattern::{Pattern, ScanOptions};
 pub use privilege::enable_debug_privilege;
 pub use process::{Process, ProcessAccess};
 pub use process_info::ProcessInfo;
-pub use region::Region;
+pub use region::{Region, RegionMap};
 
 pub use memdiver_sys::Error as OsError;
 pub use memdiver_sys::ErrorKind as OsErrorKind;

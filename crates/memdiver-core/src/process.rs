@@ -12,7 +12,13 @@ use memdiver_sys::{
 
 use crate::error::open_error;
 use crate::process_info::name_matches;
-use crate::{Address, Error, Module, ProcessInfo, Protection, Region, Result};
+use crate::{
+    Address, Error, Module, ModuleMap, ProcessInfo, Protection, Region, RegionMap, Result,
+};
+
+/// Number of attempts for an open-by-name operation whose candidate can be
+/// replaced between enumeration and verification.
+const OPEN_BY_NAME_ATTEMPTS: usize = 3;
 
 /// Requested access level for a process handle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -30,10 +36,7 @@ impl ProcessAccess {
     /// Returns `true` when this access level permits writes.
     #[must_use]
     pub fn is_writable(self) -> bool {
-        match self {
-            Self::ReadWrite => true,
-            Self::ReadOnly => false,
-        }
+        matches!(self, Self::ReadWrite)
     }
 }
 
@@ -42,6 +45,9 @@ impl ProcessAccess {
 /// Opening a process pins the underlying operating-system handle. On Linux the
 /// `/proc/<pid>/mem` descriptor refers to the memory map that existed when the
 /// handle was opened; on Windows the kernel `HANDLE` pins the process object.
+/// A Linux target that calls `execve` keeps its PID and start time but installs
+/// a new address space; reads then return [`Error::AddressSpaceReplaced`] and
+/// the handle must be reopened.
 /// Closing or dropping the `Process` never terminates or otherwise modifies the
 /// target's execution state.
 ///
@@ -170,7 +176,7 @@ impl Process {
     /// [`Error::ProcessChanged`] when the matching process keeps changing, and
     /// the same open errors as [`Process::open_with`] otherwise.
     pub fn open_by_name_with(name: &str, access: ProcessAccess) -> Result<Self> {
-        for _ in 0..3 {
+        for _ in 0..OPEN_BY_NAME_ATTEMPTS {
             let mut candidates = Self::find_by_name(name)?;
             match candidates.len() {
                 0 => {
@@ -179,7 +185,7 @@ impl Process {
                     });
                 }
                 1 => {
-                    let candidate = candidates.remove(0);
+                    let candidate = candidates.pop().expect("one candidate");
                     let process = match Self::open_with(candidate.pid(), access) {
                         Ok(process) => process,
                         Err(Error::ProcessNotFound { .. }) => continue,
@@ -190,10 +196,8 @@ impl Process {
                         }
                         Err(error) => return Err(error),
                     };
-                    if let Some(actual) = process.name()? {
-                        if !name_matches(&actual, name) {
-                            continue;
-                        }
+                    if !verified_name(process.name()?.as_deref(), name) {
+                        continue;
                     }
                     return Ok(process);
                 }
@@ -244,8 +248,8 @@ impl Process {
 
     /// Returns the target's executable file name when available.
     ///
-    /// Non-UTF-8 Linux names are converted lossily; use [`Process::exe_path`]
-    /// when the exact path bytes matter.
+    /// Names that are not valid Unicode are converted lossily; use
+    /// [`Process::exe_path`] when the exact path bytes matter.
     ///
     /// # Errors
     ///
@@ -275,24 +279,21 @@ impl Process {
     /// # Errors
     ///
     /// Returns an operating-system error wrapped in [`Error::Read`] when the
-    /// read fails, [`Error::AddressRange`] when the range overflows, or
-    /// [`Error::PartialRead`] when the operating system transfers fewer bytes
-    /// than requested. On any error the contents of `buffer` are unspecified;
-    /// inspect the `transferred` count in a partial-read error.
+    /// read fails, [`Error::AddressRange`] when the range overflows,
+    /// [`Error::AddressSpaceReplaced`] when the target replaced its address
+    /// space after opening, or [`Error::PartialRead`] when the operating system
+    /// transfers fewer bytes than requested. On any error the contents of
+    /// `buffer` are unspecified; inspect the `transferred` count in a
+    /// partial-read error.
     pub fn read(&self, address: Address, buffer: &mut [u8]) -> Result<()> {
         if buffer.is_empty() {
             return Ok(());
         }
-        validate_range(address, buffer.len())?;
+        validate_range(self.pid, address, buffer.len())?;
         let transferred = self
             .inner
             .read(address.get(), buffer)
-            .map_err(|source| Error::Read {
-                pid: self.pid,
-                address,
-                len: buffer.len(),
-                source,
-            })?;
+            .map_err(|source| self.read_error(address, buffer.len(), source))?;
         ensure_complete_read(self.pid, address, buffer.len(), transferred)
     }
 
@@ -303,12 +304,14 @@ impl Process {
     /// # Errors
     ///
     /// Returns the same errors as [`Process::read`], plus [`Error::Allocation`]
-    /// when the output buffer cannot be allocated.
+    /// when the output buffer cannot be allocated. On [`Error::PartialRead`]
+    /// the partially filled vector is not returned; use [`Process::read`] with
+    /// a caller-provided buffer when the transferred prefix is needed.
     pub fn read_bytes(&self, address: Address, len: usize) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        validate_range(address, len)?;
+        validate_range(self.pid, address, len)?;
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(len)
@@ -328,10 +331,11 @@ impl Process {
     /// # Errors
     ///
     /// Returns an operating-system error wrapped in [`Error::Write`] when the
-    /// write fails, [`Error::AddressRange`] when the range overflows, or
-    /// [`Error::PartialWrite`] when the operating system transfers fewer bytes
-    /// than requested. A failed or partial write may already have modified the
-    /// target.
+    /// write fails, [`Error::AddressRange`] when the range overflows,
+    /// [`Error::AddressSpaceReplaced`] when the target replaced its address
+    /// space after opening, or [`Error::PartialWrite`] when the operating
+    /// system transfers fewer bytes than requested. A failed or partial write
+    /// may already have modified the target.
     pub fn write(&self, address: Address, buffer: &[u8]) -> Result<()> {
         if buffer.is_empty() {
             return Ok(());
@@ -342,16 +346,11 @@ impl Process {
                 operation: "Process::write",
             });
         }
-        validate_range(address, buffer.len())?;
-        let transferred =
-            self.inner
-                .write(address.get(), buffer)
-                .map_err(|source| Error::Write {
-                    pid: self.pid,
-                    address,
-                    len: buffer.len(),
-                    source,
-                })?;
+        validate_range(self.pid, address, buffer.len())?;
+        let transferred = self
+            .inner
+            .write(address.get(), buffer)
+            .map_err(|source| self.write_error(address, buffer.len(), source))?;
         ensure_complete_write(self.pid, address, buffer.len(), transferred)
     }
 
@@ -411,7 +410,7 @@ impl Process {
                 operation: "Process::write_code",
             });
         }
-        validate_range(address, buffer.len())?;
+        validate_range(self.pid, address, buffer.len())?;
         let len = buffer.len();
         match self.inner.write_code(address.get(), buffer) {
             Ok(transferred) => ensure_complete_write(self.pid, address, len, transferred),
@@ -464,6 +463,38 @@ impl Process {
         }
     }
 
+    fn read_error(&self, address: Address, len: usize, source: memdiver_sys::Error) -> Error {
+        match source.kind() {
+            OsErrorKind::AddressSpaceReplaced => Error::AddressSpaceReplaced {
+                pid: self.pid,
+                address,
+                len,
+            },
+            _ => Error::Read {
+                pid: self.pid,
+                address,
+                len,
+                source,
+            },
+        }
+    }
+
+    fn write_error(&self, address: Address, len: usize, source: memdiver_sys::Error) -> Error {
+        match source.kind() {
+            OsErrorKind::AddressSpaceReplaced => Error::AddressSpaceReplaced {
+                pid: self.pid,
+                address,
+                len,
+            },
+            _ => Error::Write {
+                pid: self.pid,
+                address,
+                len,
+                source,
+            },
+        }
+    }
+
     fn code_write_failure(&self, address: Address, len: usize, failure: CodeWriteFailure) -> Error {
         match failure {
             CodeWriteFailure::Protect {
@@ -482,6 +513,15 @@ impl Process {
                     source,
                 },
             },
+            CodeWriteFailure::Write(source)
+                if source.kind() == OsErrorKind::AddressSpaceReplaced =>
+            {
+                Error::AddressSpaceReplaced {
+                    pid: self.pid,
+                    address,
+                    len,
+                }
+            }
             CodeWriteFailure::Write(source) => Error::Write {
                 pid: self.pid,
                 address,
@@ -522,8 +562,12 @@ impl Process {
         if size_of::<T>() == 0 {
             return Ok(T::zeroed());
         }
-        let bytes = self.read_bytes(address, size_of::<T>())?;
-        Ok(bytemuck::pod_read_unaligned(&bytes))
+        // Read directly into the value's stack storage. This avoids a heap
+        // allocation, a zero-fill and a second copy per typed read, which
+        // matters for pointer chains and repeated value reads.
+        let mut value = T::zeroed();
+        self.read(address, bytemuck::bytes_of_mut(&mut value))?;
+        Ok(value)
     }
 
     /// Writes a plain-old-data value to `address`.
@@ -538,6 +582,12 @@ impl Process {
     pub fn write_value<T: Pod>(&self, address: Address, value: T) -> Result<()> {
         if size_of::<T>() == 0 {
             return Ok(());
+        }
+        if !self.is_writable() {
+            return Err(Error::ReadOnly {
+                pid: self.pid,
+                operation: "Process::write_value",
+            });
         }
         self.write(address, bytemuck::bytes_of(&value))
     }
@@ -568,19 +618,48 @@ impl Process {
         Ok(regions)
     }
 
+    /// Returns a sorted region snapshot with binary-search lookups.
+    ///
+    /// Prefer this over repeated [`Process::region_at`] calls: the map
+    /// enumerates the process once, while every `region_at` call re-enumerates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Process::regions`].
+    pub fn region_map(&self) -> Result<RegionMap> {
+        Ok(RegionMap::new(self.regions()?))
+    }
+
+    /// Enumerates the regions needed by a scan.
+    ///
+    /// This avoids resolving module paths on Windows, where a normal
+    /// [`Process::regions`] call would also enumerate every module.
+    pub(crate) fn scan_regions(&self) -> Result<Vec<Region>> {
+        let mut regions: Vec<Region> = self
+            .inner
+            .regions_without_paths()
+            .map_err(|source| Error::Enumerate {
+                pid: self.pid,
+                what: "memory regions",
+                source,
+            })?
+            .into_iter()
+            .map(Region::from_raw)
+            .collect();
+        regions.sort_by_key(Region::base);
+        Ok(regions)
+    }
+
     /// Finds the committed region containing `address`.
+    ///
+    /// This convenience method re-enumerates the regions. Use
+    /// [`Process::region_map`] when performing several lookups.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Process::regions`].
     pub fn region_at(&self, address: Address) -> Result<Option<Region>> {
-        let regions = self.regions()?;
-        let index = regions.partition_point(|region| region.base() <= address);
-        Ok(index
-            .checked_sub(1)
-            .and_then(|index| regions.get(index))
-            .filter(|region| region.contains(address))
-            .cloned())
+        Ok(self.region_map()?.find(address).cloned())
     }
 
     /// Enumerates the executable modules loaded by the target process.
@@ -607,19 +686,28 @@ impl Process {
         Ok(modules)
     }
 
+    /// Returns a sorted module snapshot with binary-search lookups.
+    ///
+    /// Prefer this over repeated [`Process::module_at`] calls: the map
+    /// enumerates the process once, while every `module_at` call re-enumerates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Process::modules`].
+    pub fn module_map(&self) -> Result<ModuleMap> {
+        Ok(ModuleMap::new(self.modules()?))
+    }
+
     /// Finds the loaded module containing `address`.
+    ///
+    /// This convenience method re-enumerates the modules. Use
+    /// [`Process::module_map`] when performing several lookups.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Process::modules`].
     pub fn module_at(&self, address: Address) -> Result<Option<Module>> {
-        let modules = self.modules()?;
-        let index = modules.partition_point(|module| module.base() <= address);
-        Ok(index
-            .checked_sub(1)
-            .and_then(|index| modules.get(index))
-            .filter(|module| module.contains(address))
-            .cloned())
+        Ok(self.module_map()?.find(address).cloned())
     }
 
     /// Finds a module by exact name.
@@ -643,9 +731,11 @@ impl Process {
     ///
     /// A range can span pages with different protections, but Windows reports
     /// only one previous protection value. Restoring with that single value can
-    /// silently change the protection of the remaining pages. Use
-    /// [`Process::write_code`] for a reversible code patch instead of
-    /// hand-rolling protect + write + restore; it captures and restores
+    /// silently change the protection of the remaining pages. The returned
+    /// [`Protection`] is also a semantic view: raw flags such as
+    /// `PAGE_WRITECOPY` or `PAGE_NOCACHE` cannot be reconstructed from it.
+    /// Use [`Process::write_code`] for a reversible code patch instead of
+    /// hand-rolling protect + write + restore; it captures and restores raw
     /// protection page by page and reports a composite error when restoration
     /// fails.
     ///
@@ -665,19 +755,19 @@ impl Process {
         len: usize,
         protection: Protection,
     ) -> Result<Protection> {
-        if len == 0 {
-            return Err(Error::InvalidLength {
-                operation: "Process::protect",
-                len,
-            });
-        }
         if !self.is_writable() {
             return Err(Error::ReadOnly {
                 pid: self.pid,
                 operation: "Process::protect",
             });
         }
-        validate_range(address, len)?;
+        if len == 0 {
+            return Err(Error::InvalidLength {
+                operation: "Process::protect",
+                len,
+            });
+        }
+        validate_range(self.pid, address, len)?;
         self.inner
             .protect(address.get(), len, protection)
             .map_err(|source| match source.kind() {
@@ -686,6 +776,9 @@ impl Process {
                     reason: "the platform does not allow one process to change another process's page protections",
                 },
                 OsErrorKind::InvalidProtection => Error::InvalidProtection {
+                    pid: self.pid,
+                    address,
+                    len,
                     protection,
                     source,
                 },
@@ -697,6 +790,14 @@ impl Process {
                 },
             })
     }
+}
+
+/// Returns whether an opened process's image name matches the requested name.
+///
+/// An unavailable name is not a match: returning the handle would skip the
+/// post-open verification required for a safe name-based open.
+fn verified_name(actual: Option<&str>, requested: &str) -> bool {
+    actual.is_some_and(|actual| name_matches(actual, requested))
 }
 
 fn ensure_complete_read(
@@ -735,12 +836,12 @@ fn ensure_complete_write(
     }
 }
 
-fn validate_range(address: Address, len: usize) -> Result<()> {
-    let len64 = u64::try_from(len).map_err(|_| Error::AddressRange { address, len })?;
+fn validate_range(pid: u32, address: Address, len: usize) -> Result<()> {
+    let len64 = u64::try_from(len).map_err(|_| Error::AddressRange { pid, address, len })?;
     address
         .get()
         .checked_add(len64)
-        .ok_or(Error::AddressRange { address, len })?;
+        .ok_or(Error::AddressRange { pid, address, len })?;
     Ok(())
 }
 
@@ -758,7 +859,9 @@ mod tests {
     // `Process::write_code` documents instruction-cache coherence only for x86
     // and x86_64. These cfg-gated tests pin that documented architecture
     // condition without requiring a cache flush on other targets, where the
-    // helper remains available but makes no visibility promise.
+    // helper remains available but makes no visibility promise. They are
+    // compile-time architecture gates rather than behavioural tests: the
+    // `cfg` selects the assertion, so they cannot fail on a supported target.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn write_code_cache_coherence_guarantee_applies_on_x86() {
@@ -771,6 +874,17 @@ mod tests {
     fn write_code_cache_coherence_guarantee_does_not_apply_off_x86() {
         let arch = std::hint::black_box(std::env::consts::ARCH);
         assert!(!matches!(arch, "x86" | "x86_64"), "unexpected arch {arch}");
+    }
+
+    #[test]
+    fn unavailable_names_are_never_verified() {
+        assert!(!verified_name(None, "game.exe"));
+        assert!(verified_name(Some("game.exe"), "game.exe"));
+        assert!(!verified_name(Some("other.exe"), "game.exe"));
+        #[cfg(windows)]
+        assert!(verified_name(Some("GAME.EXE"), "game.exe"));
+        #[cfg(not(windows))]
+        assert!(!verified_name(Some("GAME.EXE"), "game.exe"));
     }
 
     #[test]
@@ -808,15 +922,15 @@ mod tests {
 
     #[test]
     fn validates_address_ranges() {
-        assert!(validate_range(Address::new(0), 16).is_ok());
-        assert!(validate_range(Address::new(u64::MAX), 0).is_ok());
-        assert!(validate_range(Address::new(u64::MAX), 1).is_err());
+        assert!(validate_range(7, Address::new(0), 16).is_ok());
+        assert!(validate_range(7, Address::new(u64::MAX), 0).is_ok());
+        assert!(validate_range(7, Address::new(u64::MAX), 1).is_err());
         assert_eq!(
-            validate_range(Address::new(u64::MAX), 1)
+            validate_range(7, Address::new(u64::MAX), 1)
                 .expect_err("must fail")
                 .to_string(),
             format!(
-                "address range starting at {} with length 1 is invalid",
+                "address range starting at {} with length 1 is invalid in process 7",
                 Address::new(u64::MAX)
             )
         );

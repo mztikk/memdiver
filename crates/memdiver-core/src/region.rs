@@ -9,7 +9,7 @@ use crate::{Address, Protection, RegionKind};
 /// A committed memory region in the target process.
 ///
 /// Regions are a snapshot of the target's virtual memory at the time
-/// [`Process::regions`](crate::Process::regions) was called. They do not update
+/// [`crate::Process::regions`](crate::Process::regions) was called. They do not update
 /// when the target changes its mappings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
@@ -100,6 +100,54 @@ impl Region {
     }
 }
 
+/// A sorted snapshot of a process's committed regions with binary-search
+/// lookups.
+///
+/// Use this when looking up more than one address: [`crate::Process::region_at`]
+/// re-enumerates the process for every call, while a `RegionMap` enumerates
+/// once. The snapshot is stale as soon as it is created, just like the vector
+/// returned by [`crate::Process::regions`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionMap {
+    regions: Vec<Region>,
+}
+
+impl RegionMap {
+    pub(crate) fn new(regions: Vec<Region>) -> Self {
+        Self { regions }
+    }
+
+    /// Returns all regions, sorted by base address.
+    #[must_use]
+    pub fn regions(&self) -> &[Region] {
+        &self.regions
+    }
+
+    /// Returns the region containing `address`, if any.
+    #[must_use]
+    pub fn find(&self, address: Address) -> Option<&Region> {
+        let index = self
+            .regions
+            .partition_point(|region| region.base() <= address);
+        index
+            .checked_sub(1)
+            .and_then(|index| self.regions.get(index))
+            .filter(|region| region.contains(address))
+    }
+
+    /// Returns `true` when the snapshot contains no regions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// Returns the number of regions in the snapshot.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -135,6 +183,24 @@ mod tests {
         assert!(region.contains(Address::new(0x1000)));
         assert!(region.contains(Address::new(0x11ff)));
         assert!(!region.contains(Address::new(0x1200)));
+    }
+
+    #[test]
+    fn map_finds_regions_by_address() {
+        let map = RegionMap::new(vec![region(0x1000, 0x200), region(0x2000, 0x100)]);
+        assert_eq!(map.len(), 2);
+        assert!(!map.is_empty());
+        assert_eq!(
+            map.find(Address::new(0x1100)).map(Region::base),
+            Some(Address::new(0x1000))
+        );
+        assert_eq!(
+            map.find(Address::new(0x2000)).map(Region::base),
+            Some(Address::new(0x2000))
+        );
+        assert!(map.find(Address::new(0x1200)).is_none());
+        assert!(map.find(Address::NULL).is_none());
+        assert_eq!(map.regions().len(), 2);
     }
 
     #[test]

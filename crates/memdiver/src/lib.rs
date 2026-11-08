@@ -79,7 +79,7 @@
 #![forbid(unsafe_code)]
 
 pub use memdiver_core::{
-    Address, Error, Export, Module, OsError, OsErrorKind, Pattern, PointerWidth, Process,
-    ProcessAccess, ProcessInfo, Protection, Region, RegionKind, Result, ScanOptions,
-    enable_debug_privilege,
+    Address, Error, Export, Module, ModuleMap, OsError, OsErrorKind, Pattern, PointerWidth,
+    Process, ProcessAccess, ProcessInfo, Protection, Region, RegionKind, RegionMap, Result,
+    ScanOptions, enable_debug_privilege,
 };

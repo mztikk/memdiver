@@ -10,7 +10,9 @@
 //! The memory file descriptor refers to the memory map that existed when it was
 //! opened. The start time lets the handle detect PID reuse for the queries that
 //! have to reopen procfs files (maps and stat). This is why the handle never
-//! performs a read by PID alone.
+//! performs a read by PID alone. A target `execve` keeps the PID and start time
+//! but installs a new address space; the pinned descriptor then returns zero
+//! bytes and reads report [`ErrorKind::AddressSpaceReplaced`].
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, OsString};
@@ -19,6 +21,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -180,7 +183,11 @@ impl ProcessHandle {
             return Ok(0);
         }
         let offset = procfs_offset(address, buffer.len())?;
-        pread(&self.mem, buffer, offset).map_err(io_error)
+        let transferred = pread(&self.mem, buffer, offset).map_err(mem_io_error)?;
+        if transferred == 0 {
+            return Err(self.zero_transfer_error(address, buffer.len()));
+        }
+        Ok(transferred)
     }
 
     /// Writes up to `buffer.len()` bytes starting at `address`.
@@ -197,7 +204,11 @@ impl ProcessHandle {
             return Ok(0);
         }
         let offset = procfs_offset(address, buffer.len())?;
-        pwrite(&self.mem, buffer, offset).map_err(io_error)
+        let transferred = pwrite(&self.mem, buffer, offset).map_err(mem_io_error)?;
+        if transferred == 0 {
+            return Err(self.zero_transfer_error(address, buffer.len()));
+        }
+        Ok(transferred)
     }
 
     /// Writes `buffer` at `address` and returns the number of bytes transferred.
@@ -294,26 +305,105 @@ impl ProcessHandle {
     pub fn regions(&self) -> Result<Vec<RawRegion>, Error> {
         self.ensure_same_process()?;
         let data = read_proc_file(&self.proc_dir, MAPS)?;
-        let regions = parse_maps(&data, self.pid)?;
+        let entries = parse_maps(&data, self.pid)?;
         // Check again after reading: a PID reused while `/proc/<pid>/maps` was
         // open would otherwise produce regions that belong to another process.
         self.ensure_same_process()?;
-        Ok(regions)
+        Ok(entries.into_iter().map(|entry| entry.region).collect())
+    }
+
+    /// Enumerates committed regions without resolving module paths.
+    ///
+    /// Linux always parses the pathname while reading `/proc/<pid>/maps`, so
+    /// this is equivalent to [`ProcessHandle::regions`]; it exists for API
+    /// parity with the Windows backend and for scan callers that do not need
+    /// paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ProcessHandle::regions`].
+    pub fn regions_without_paths(&self) -> Result<Vec<RawRegion>, Error> {
+        self.regions()
     }
 
     /// Enumerates the executable modules loaded by the process.
     ///
     /// On Linux a module is a file-backed mapping with at least one executable
-    /// segment. All mappings of that file are merged into one module whose base
-    /// is the lowest mapping address.
+    /// segment. Mappings are merged by `(device, inode)`, so all mappings of one
+    /// file form one module whose base is the lowest mapping address. Distinct
+    /// files that happen to share a path (for example a deleted mapping and its
+    /// replacement) are separate modules.
     ///
     /// # Errors
     ///
     /// Returns an error when the process exited, PID reuse is detected, or
     /// `/proc/<pid>/maps` cannot be read or parsed.
     pub fn modules(&self) -> Result<Vec<RawModule>, Error> {
-        let regions = self.regions()?;
-        Ok(modules_from_regions(&regions))
+        self.ensure_same_process()?;
+        let data = read_proc_file(&self.proc_dir, MAPS)?;
+        let entries = parse_maps(&data, self.pid)?;
+        self.ensure_same_process()?;
+        Ok(modules_from_entries(&entries))
+    }
+
+    /// Reads a mapped module file through the target's root and returns its
+    /// bytes.
+    ///
+    /// The path is the one `/proc/<pid>/maps` reported, interpreted inside the
+    /// target's mount namespace (`/proc/<pid>/root`), not the caller's. The
+    /// opened file must be a regular file no larger than
+    /// [`MAX_MODULE_FILE_SIZE`](crate::MAX_MODULE_FILE_SIZE), and its inode
+    /// must still match the mapping (the reported device can differ under
+    /// overlay/Btrfs, so the inode is the stable identity). This rejects device
+    /// files, FIFOs, huge files and replaced files before any parsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::MalformedData`] when the mapping disappeared, the
+    /// file is not a regular file, is too large, or changed since it was
+    /// mapped. Operating-system errors from opening or reading the file are
+    /// preserved.
+    pub fn read_module_file(&self, base: u64, path: &Path) -> Result<Vec<u8>, Error> {
+        self.ensure_same_process()?;
+        let data = read_proc_file(&self.proc_dir, MAPS)?;
+        let entries = parse_maps(&data, self.pid)?;
+        self.ensure_same_process()?;
+
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry.region.path.as_deref() == Some(path)
+                    && entry.region.base <= base
+                    && base < entry.region.base.saturating_add(entry.region.size)
+            })
+            .ok_or_else(|| {
+                Error::malformed(format!(
+                    "module mapping for {} is no longer present",
+                    path.display()
+                ))
+            })?;
+        let file_id = entry.file_id.ok_or_else(|| {
+            Error::malformed(format!(
+                "module mapping for {} has no file identity",
+                path.display()
+            ))
+        })?;
+
+        let full_path = target_root_path(self.pid, path)?;
+        let file = File::open(&full_path).map_err(io_error)?;
+        let metadata = file.metadata().map_err(io_error)?;
+        // Compare the inode rather than `(st_dev, st_ino)`: overlayfs and btrfs
+        // subvolumes can report a different `st_dev` for the path than for the
+        // mapping while the inode is stable. A replacement file cannot reuse
+        // the inode while the target still maps the old file, so the inode is
+        // the reliable identity here.
+        if metadata.ino() != file_id.inode {
+            return Err(Error::malformed(format!(
+                "module file {} changed since it was mapped",
+                path.display()
+            )));
+        }
+        crate::read_bounded_file(file, crate::MAX_MODULE_FILE_SIZE, io_error)
     }
 
     /// Changes the protection of a memory range.
@@ -338,6 +428,27 @@ impl ProcessHandle {
             None,
             "changing another process's page protection is not supported on Linux",
         ))
+    }
+
+    /// Builds the error for a zero-byte transfer on a non-empty request.
+    ///
+    /// A live process with an unchanged start time but a zero-byte transfer has
+    /// replaced its address space (typically via `execve`): the pinned
+    /// `/proc/<pid>/mem` descriptor refers to the previous `mm`. A process that
+    /// is gone is reported as exited instead.
+    fn zero_transfer_error(&self, address: u64, len: usize) -> Error {
+        if self.is_alive() {
+            Error::new(
+                ErrorKind::AddressSpaceReplaced,
+                None,
+                format!(
+                    "process {} replaced its address space before a {len}-byte access at {address:#x}; reopen the process",
+                    self.pid
+                ),
+            )
+        } else {
+            process_exited(self.pid)
+        }
     }
 
     fn current_stat(&self) -> Result<Stat, Error> {
@@ -394,25 +505,31 @@ pub fn processes() -> Result<Vec<RawProcessInfo>, Error> {
 fn process_info(pid: u32) -> Option<RawProcessInfo> {
     let dir = File::open(format!("/proc/{pid}")).ok()?;
     let exe_path = read_link_at(&dir, EXE).ok().map(strip_deleted);
-    let comm = read_proc_file(&dir, COMM).ok().and_then(|data| {
-        let end = data
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(data.len());
-        let name = String::from_utf8_lossy(data.get(..end)?).into_owned();
-        (!name.is_empty()).then_some(name)
-    });
-
     let exe_name = exe_path
         .as_deref()
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned());
-    let name = exe_name.or(comm)?;
+    // Only read `comm` when the executable name did not decide the result; in
+    // the common case this saves an open/read/close per process.
+    let name = match exe_name {
+        Some(name) => name,
+        None => read_comm(&dir)?,
+    };
     Some(RawProcessInfo {
         pid,
         name,
         exe_path,
     })
+}
+
+fn read_comm(dir: &File) -> Option<String> {
+    let data = read_proc_file(dir, COMM).ok()?;
+    let end = data
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(data.len());
+    let name = String::from_utf8_lossy(data.get(..end)?).into_owned();
+    (!name.is_empty()).then_some(name)
 }
 
 fn strip_deleted(path: PathBuf) -> PathBuf {
@@ -641,6 +758,23 @@ fn poll_timeout_millis(remaining: Duration) -> libc::c_int {
     millis.min(libc::c_int::MAX as u128) as libc::c_int
 }
 
+/// Classifies an error from a `/proc/<pid>/mem` transfer.
+///
+/// The kernel reports an unmapped address as `EIO`, which is the most common
+/// failure in this library. Map it to `InvalidAddress` (keeping errno) so it is
+/// distinguishable from unrelated I/O failures and matches Windows.
+fn mem_io_error(error: io::Error) -> Error {
+    if error.raw_os_error() == Some(libc::EIO) {
+        Error::new(
+            ErrorKind::InvalidAddress,
+            Some(libc::EIO),
+            io_message(libc::EIO),
+        )
+    } else {
+        io_error(error)
+    }
+}
+
 fn io_error(error: io::Error) -> Error {
     let raw_code = error.raw_os_error();
     let kind = match raw_code {
@@ -662,8 +796,28 @@ struct Stat {
 }
 
 fn read_stat(dir: &File, pid: u32) -> Result<Stat, Error> {
-    let data = read_proc_file(dir, STAT)?;
-    parse_stat(&data, pid)
+    // `/proc/<pid>/stat` is a few hundred bytes. Read it into a fixed buffer so
+    // a liveness poll does not allocate on every tick.
+    let mut file = open_proc_file(dir, STAT, libc::O_RDONLY).map_err(io_error)?;
+    let mut buffer = [0u8; 4096];
+    let mut length = 0usize;
+    loop {
+        match file.read(&mut buffer[length..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                length += read;
+                if length == buffer.len() {
+                    return Err(Error::malformed(format!(
+                        "/proc/{pid}/stat is larger than {} bytes",
+                        buffer.len()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+    parse_stat(&buffer[..length], pid)
 }
 
 fn parse_stat(data: &[u8], pid: u32) -> Result<Stat, Error> {
@@ -699,31 +853,46 @@ fn is_dead_state(state: u8) -> bool {
     matches!(state, b'Z' | b'X' | b'x')
 }
 
-fn parse_maps(data: &[u8], pid: u32) -> Result<Vec<RawRegion>, Error> {
-    let mut regions = Vec::new();
+/// Identity of a mapped file, taken from the `dev` and `inode` columns of
+/// `/proc/<pid>/maps`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FileId {
+    dev: u64,
+    inode: u64,
+}
+
+/// One parsed `/proc/<pid>/maps` line.
+#[derive(Debug)]
+struct MapsEntry {
+    region: RawRegion,
+    file_id: Option<FileId>,
+}
+
+fn parse_maps(data: &[u8], pid: u32) -> Result<Vec<MapsEntry>, Error> {
+    let mut entries = Vec::new();
     for (index, line) in data.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        let region = parse_maps_line(line).map_err(|reason| {
+        let entry = parse_maps_line(line).map_err(|reason| {
             Error::malformed(format!(
                 "/proc/{pid}/maps line {} is malformed: {reason}",
                 index + 1
             ))
         })?;
-        regions.push(region);
+        entries.push(entry);
     }
-    regions.sort_by_key(|region| region.base);
-    Ok(regions)
+    entries.sort_by_key(|entry| entry.region.base);
+    Ok(entries)
 }
 
-fn parse_maps_line(line: &[u8]) -> Result<RawRegion, String> {
+fn parse_maps_line(line: &[u8]) -> Result<MapsEntry, String> {
     let mut position = 0;
     let range = next_field(line, &mut position).ok_or("missing address range")?;
     let permissions = next_field(line, &mut position).ok_or("missing permissions")?;
-    next_field(line, &mut position).ok_or("missing file offset")?;
-    next_field(line, &mut position).ok_or("missing device")?;
-    next_field(line, &mut position).ok_or("missing inode")?;
+    let _offset = next_field(line, &mut position).ok_or("missing file offset")?;
+    let device = next_field(line, &mut position).ok_or("missing device")?;
+    let inode = next_field(line, &mut position).ok_or("missing inode")?;
 
     let (base, end) = parse_range(range)?;
     let protection = parse_permissions(permissions)?;
@@ -736,6 +905,8 @@ fn parse_maps_line(line: &[u8]) -> Result<RawRegion, String> {
             position += 1;
         }
         let bytes = line.get(position..).unwrap_or_default();
+        // The kernel appends this marker for deleted mappings. A real file name
+        // ending in the same text is indistinguishable; accept the ambiguity.
         let bytes = bytes.strip_suffix(b" (deleted)").unwrap_or(bytes);
         if bytes.is_empty() || bytes.first() == Some(&b'[') {
             None
@@ -748,13 +919,39 @@ fn parse_maps_line(line: &[u8]) -> Result<RawRegion, String> {
     } else {
         RegionKind::Private
     };
+    let file_id = match &path {
+        Some(_) => Some(parse_file_id(device, inode)?),
+        None => None,
+    };
 
-    Ok(RawRegion {
-        base,
-        size: end - base,
-        protection,
-        kind,
-        path,
+    Ok(MapsEntry {
+        region: RawRegion {
+            base,
+            size: end - base,
+            protection,
+            kind,
+            path,
+        },
+        file_id,
+    })
+}
+
+fn parse_file_id(device: &[u8], inode: &[u8]) -> Result<FileId, String> {
+    let device = std::str::from_utf8(device).map_err(|_| "device is not ASCII")?;
+    let (major, minor) = device
+        .split_once(':')
+        .ok_or("device does not contain ':'")?;
+    let major =
+        u32::from_str_radix(major, 16).map_err(|_| format!("invalid device major {major:?}"))?;
+    let minor =
+        u32::from_str_radix(minor, 16).map_err(|_| format!("invalid device minor {minor:?}"))?;
+    let inode = std::str::from_utf8(inode)
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or("invalid inode")?;
+    Ok(FileId {
+        dev: libc::makedev(major, minor) as u64,
+        inode,
     })
 }
 
@@ -812,30 +1009,43 @@ fn permission(actual: u8, expected: u8, flag: Protection) -> Result<Protection, 
     }
 }
 
-fn modules_from_regions(regions: &[RawRegion]) -> Vec<RawModule> {
-    let executable_paths: HashSet<&Path> = regions
+fn modules_from_entries(entries: &[MapsEntry]) -> Vec<RawModule> {
+    let executable_files: HashSet<FileId> = entries
         .iter()
-        .filter(|region| region.protection.is_executable())
-        .filter_map(|region| region.path.as_deref())
+        .filter(|entry| entry.region.protection.is_executable())
+        .filter_map(|entry| entry.file_id)
         .collect();
 
-    let mut spans: HashMap<&Path, (u64, u64)> = HashMap::new();
-    for region in regions {
-        let Some(path) = region.path.as_deref() else {
+    let mut spans: HashMap<FileId, (u64, u64, &Path)> = HashMap::new();
+    for entry in entries {
+        let Some(file_id) = entry.file_id else {
             continue;
         };
-        if !executable_paths.contains(path) {
+        if !executable_files.contains(&file_id) {
             continue;
         }
-        let end = region.base.saturating_add(region.size);
-        let span = spans.entry(path).or_insert((region.base, end));
-        span.0 = span.0.min(region.base);
-        span.1 = span.1.max(end);
+        let Some(path) = entry.region.path.as_deref() else {
+            continue;
+        };
+        let end = entry.region.base.saturating_add(entry.region.size);
+        match spans.entry(file_id) {
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert((entry.region.base, end, path));
+            }
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                let span = occupied.get_mut();
+                if entry.region.base < span.0 {
+                    span.0 = entry.region.base;
+                    span.2 = path;
+                }
+                span.1 = span.1.max(end);
+            }
+        }
     }
 
     let mut modules: Vec<RawModule> = spans
         .into_iter()
-        .filter_map(|(path, (base, end))| {
+        .filter_map(|(_, (base, end, path))| {
             let size = end.checked_sub(base)?;
             if size == 0 {
                 return None;
@@ -858,6 +1068,25 @@ fn modules_from_regions(regions: &[RawRegion]) -> Vec<RawModule> {
             .then_with(|| left.name.cmp(&right.name))
     });
     modules
+}
+
+/// Builds the path of a target-namespace file for opening through
+/// `/proc/<pid>/root`.
+fn target_root_path(pid: u32, path: &Path) -> Result<PathBuf, Error> {
+    let safe = path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir));
+    if !safe {
+        return Err(Error::malformed(format!(
+            "module path {} is not a safe absolute path",
+            path.display()
+        )));
+    }
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| Error::malformed(format!("module path {} is not absolute", path.display())))?;
+    Ok(PathBuf::from(format!("/proc/{pid}/root")).join(relative))
 }
 
 #[cfg(test)]
@@ -935,7 +1164,8 @@ mod tests {
     #[test]
     fn parses_regular_maps_entry() {
         let line = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 1234 /usr/lib/libfoo.so.1";
-        let region = parse_maps_line(line).expect("valid maps line");
+        let entry = parse_maps_line(line).expect("valid maps line");
+        let region = &entry.region;
         assert_eq!(region.base, 0x7f00_0000_0000);
         assert_eq!(region.size, 0x1000);
         assert_eq!(region.protection, Protection::READ | Protection::EXECUTE);
@@ -944,19 +1174,30 @@ mod tests {
             region.path.as_deref(),
             Some(Path::new("/usr/lib/libfoo.so.1"))
         );
+        assert_eq!(
+            entry.file_id,
+            Some(FileId {
+                dev: libc::makedev(8, 1) as u64,
+                inode: 1234
+            })
+        );
     }
 
     #[test]
     fn parses_shared_and_write_only_permissions() {
         let shared = parse_maps_line(b"1000-2000 rw-s 00000000 00:00 0 /tmp/shared")
             .expect("valid maps line");
-        assert_eq!(shared.protection, Protection::READ | Protection::WRITE);
+        assert_eq!(
+            shared.region.protection,
+            Protection::READ | Protection::WRITE
+        );
 
         let write_only =
             parse_maps_line(b"2000-3000 -w-p 00000000 00:00 0").expect("valid maps line");
-        assert_eq!(write_only.protection, Protection::WRITE);
-        assert_eq!(write_only.path, None);
-        assert_eq!(write_only.kind, RegionKind::Private);
+        assert_eq!(write_only.region.protection, Protection::WRITE);
+        assert_eq!(write_only.region.path, None);
+        assert_eq!(write_only.region.kind, RegionKind::Private);
+        assert_eq!(write_only.file_id, None);
     }
 
     #[test]
@@ -965,9 +1206,9 @@ mod tests {
             "1000-2000 rw-p 00000000 00:00 7",
             "/tmp/name with spaces (deleted)",
         );
-        let region = parse_maps_line(&line).expect("valid maps line");
+        let entry = parse_maps_line(&line).expect("valid maps line");
         assert_eq!(
-            region.path.as_deref(),
+            entry.region.path.as_deref(),
             Some(Path::new("/tmp/name with spaces"))
         );
     }
@@ -975,17 +1216,17 @@ mod tests {
     #[test]
     fn parses_pathname_column_padding() {
         let line = b"1000-2000 r-xp 00000000 00:00 1234                    /usr/lib/libfoo.so.1";
-        let region = parse_maps_line(line).expect("valid padded maps line");
+        let entry = parse_maps_line(line).expect("valid padded maps line");
         assert_eq!(
-            region.path.as_deref(),
+            entry.region.path.as_deref(),
             Some(Path::new("/usr/lib/libfoo.so.1"))
         );
 
         let heap =
             parse_maps_line(b"2000-3000 rw-p 00000000 00:00 0                          [heap]")
                 .expect("valid padded heap line");
-        assert_eq!(heap.path, None);
-        assert_eq!(heap.kind, RegionKind::Private);
+        assert_eq!(heap.region.path, None);
+        assert_eq!(heap.region.kind, RegionKind::Private);
     }
 
     #[test]
@@ -993,8 +1234,8 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let line = b"1000-2000 r-xp 00000000 00:00 9 /tmp/name-\xff";
-        let region = parse_maps_line(line).expect("valid maps line");
-        let path = region.path.expect("file-backed mapping has a path");
+        let entry = parse_maps_line(line).expect("valid maps line");
+        let path = entry.region.path.expect("file-backed mapping has a path");
         assert_eq!(path.as_os_str().as_bytes(), b"/tmp/name-\xff");
     }
 
@@ -1002,8 +1243,8 @@ mod tests {
     fn special_mappings_have_no_path() {
         let heap =
             parse_maps_line(b"5555-6666 rw-p 00000000 00:00 0 [heap]").expect("valid maps line");
-        assert_eq!(heap.path, None);
-        assert_eq!(heap.kind, RegionKind::Private);
+        assert_eq!(heap.region.path, None);
+        assert_eq!(heap.region.kind, RegionKind::Private);
     }
 
     #[test]
@@ -1028,51 +1269,80 @@ mod tests {
 
     #[test]
     fn parse_maps_sorts_and_numbers_lines() {
-        let data = b"2000-3000 rw-p 0 0 0 [heap]\n1000-2000 r-xp 0 0 0 /bin/app\n";
-        let regions = parse_maps(data, 7).expect("valid maps");
-        assert_eq!(regions.len(), 2);
-        assert_eq!(regions[0].base, 0x1000);
-        assert_eq!(regions[1].base, 0x2000);
+        let data = b"2000-3000 rw-p 0 00:00 0 [heap]\n1000-2000 r-xp 0 00:00 0 /bin/app\n";
+        let entries = parse_maps(data, 7).expect("valid maps");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].region.base, 0x1000);
+        assert_eq!(entries[1].region.base, 0x2000);
 
-        let error = parse_maps(b"1000-2000 rw-p 0 0 0\nbad\n", 7).expect_err("must fail");
+        let error = parse_maps(b"1000-2000 rw-p 0 00:00 0\nbad\n", 7).expect_err("must fail");
         assert_eq!(error.kind(), ErrorKind::MalformedData);
         assert!(error.message().contains("line 2"));
     }
 
-    fn raw_region(base: u64, size: u64, protection: Protection, path: Option<&str>) -> RawRegion {
-        RawRegion {
-            base,
-            size,
-            protection,
-            kind: if path.is_some() {
-                RegionKind::Mapped
-            } else {
-                RegionKind::Private
+    fn raw_entry(
+        base: u64,
+        size: u64,
+        protection: Protection,
+        path: Option<&str>,
+        inode: Option<u64>,
+    ) -> MapsEntry {
+        MapsEntry {
+            region: RawRegion {
+                base,
+                size,
+                protection,
+                kind: if path.is_some() {
+                    RegionKind::Mapped
+                } else {
+                    RegionKind::Private
+                },
+                path: path.map(PathBuf::from),
             },
-            path: path.map(PathBuf::from),
+            file_id: inode.map(|inode| FileId { dev: 1, inode }),
         }
     }
 
     #[test]
     fn modules_merge_executable_mappings_only() {
-        let regions = vec![
-            raw_region(0x1000, 0x1000, Protection::READ, Some("/lib/libx.so.1")),
-            raw_region(
+        let entries = vec![
+            raw_entry(
+                0x1000,
+                0x1000,
+                Protection::READ,
+                Some("/lib/libx.so.1"),
+                Some(10),
+            ),
+            raw_entry(
                 0x2000,
                 0x1000,
                 Protection::READ | Protection::EXECUTE,
                 Some("/lib/libx.so.1"),
+                Some(10),
             ),
-            raw_region(0x3000, 0x1000, Protection::READ, Some("/data/file")),
-            raw_region(0x4000, 0x1000, Protection::READ | Protection::WRITE, None),
-            raw_region(
+            raw_entry(
+                0x3000,
+                0x1000,
+                Protection::READ,
+                Some("/data/file"),
+                Some(11),
+            ),
+            raw_entry(
+                0x4000,
+                0x1000,
+                Protection::READ | Protection::WRITE,
+                None,
+                None,
+            ),
+            raw_entry(
                 0x5000,
                 0x1000,
                 Protection::READ | Protection::EXECUTE,
                 Some("/usr/bin/app"),
+                Some(12),
             ),
         ];
-        let modules = modules_from_regions(&regions);
+        let modules = modules_from_entries(&entries);
         assert_eq!(modules.len(), 2);
         assert_eq!(modules[0].name, "libx.so.1");
         assert_eq!(modules[0].base, 0x1000);
@@ -1083,14 +1353,49 @@ mod tests {
     }
 
     #[test]
+    fn modules_do_not_merge_distinct_files_with_one_path() {
+        let entries = vec![
+            raw_entry(
+                0x1000,
+                0x1000,
+                Protection::READ | Protection::EXECUTE,
+                Some("/opt/app/libfoo.so"),
+                Some(20),
+            ),
+            raw_entry(
+                0x3000,
+                0x1000,
+                Protection::READ | Protection::EXECUTE,
+                Some("/opt/app/libfoo.so"),
+                Some(21),
+            ),
+        ];
+        let modules = modules_from_entries(&entries);
+        assert_eq!(modules.len(), 2);
+        assert_eq!(modules[0].base, 0x1000);
+        assert_eq!(modules[1].base, 0x3000);
+    }
+
+    #[test]
     fn modules_ignore_anonymous_executable_mappings() {
-        let regions = vec![raw_region(
+        let entries = vec![raw_entry(
             0x1000,
             0x1000,
             Protection::READ | Protection::EXECUTE,
             None,
+            None,
         )];
-        assert!(modules_from_regions(&regions).is_empty());
+        assert!(modules_from_entries(&entries).is_empty());
+    }
+
+    #[test]
+    fn builds_target_root_paths_and_rejects_escapes() {
+        assert_eq!(
+            target_root_path(42, Path::new("/usr/lib/libfoo.so")).expect("valid path"),
+            PathBuf::from("/proc/42/root/usr/lib/libfoo.so")
+        );
+        assert!(target_root_path(42, Path::new("relative/libfoo.so")).is_err());
+        assert!(target_root_path(42, Path::new("/usr/../etc/passwd")).is_err());
     }
 
     #[test]
@@ -1131,6 +1436,45 @@ mod tests {
         );
         writer.write_all(b"x").expect("write pipe");
         assert!(poll_pidfd(reader.as_raw_fd(), Some(Duration::from_secs(1))).expect("wake poll"));
+
+        // Dropping the writer leaves only POLLHUP on the read end.
+        drop(writer);
+        assert!(poll_pidfd(reader.as_raw_fd(), Some(Duration::from_secs(1))).expect("hangup poll"));
+    }
+
+    #[test]
+    fn start_time_mismatch_is_reported_as_exited() {
+        let handle = ProcessHandle::open(std::process::id()).expect("open self");
+        let bogus = ProcessHandle {
+            start_time: handle.start_time.wrapping_add(1),
+            ..handle
+        };
+        assert!(!bogus.is_alive());
+        assert_eq!(
+            bogus
+                .ensure_same_process()
+                .expect_err("a reused PID must be rejected")
+                .kind(),
+            ErrorKind::ProcessExited
+        );
+        assert!(bogus.regions().is_err());
+    }
+
+    #[test]
+    fn polling_fallback_observes_exit() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.05")
+            .spawn()
+            .expect("spawn sleep");
+        let handle = ProcessHandle::open(child.id()).expect("open child");
+        assert!(
+            handle
+                .wait_for_exit_polling(Some(Duration::from_secs(2)))
+                .expect("polling wait"),
+            "the polling fallback must observe the child's exit"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -1160,6 +1504,14 @@ mod tests {
         assert_eq!(
             io_error(io::Error::from_raw_os_error(libc::EINVAL)).kind(),
             ErrorKind::InvalidAddress
+        );
+        assert_eq!(
+            mem_io_error(io::Error::from_raw_os_error(libc::EIO)).kind(),
+            ErrorKind::InvalidAddress
+        );
+        assert_eq!(
+            mem_io_error(io::Error::from_raw_os_error(libc::EACCES)).kind(),
+            ErrorKind::PermissionDenied
         );
     }
 }

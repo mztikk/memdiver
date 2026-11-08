@@ -84,6 +84,37 @@ fn rejects_overflowing_code_write_ranges_without_an_os_call() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn writes_existing_bytes_to_read_only_executable_code_on_linux() {
+    let mut fixture = Fixture::spawn();
+    let (address, len) = fixture.code_target();
+    let region = fixture
+        .process
+        .region_at(address)
+        .expect("region query")
+        .expect("code target must be inside a committed region");
+    assert!(region.is_executable(), "{region:?}");
+    assert!(!region.is_writable(), "{region:?}");
+
+    let original = fixture
+        .process
+        .read_bytes(address, len)
+        .expect("read code target");
+    fixture
+        .process
+        .write_code(address, &original)
+        .expect("scoped code write through /proc/<pid>/mem");
+    assert_eq!(
+        fixture
+            .process
+            .read_bytes(address, len)
+            .expect("read code target after write"),
+        original
+    );
+    fixture.ping();
+}
+
 #[cfg(windows)]
 #[test]
 fn writes_to_read_only_executable_code_and_restores_protection() {
@@ -137,6 +168,59 @@ fn writes_to_read_only_executable_code_and_restores_protection() {
     assert!(!restored.is_writable());
 
     fixture.ping();
+}
+
+#[cfg(windows)]
+#[test]
+fn unaligned_multi_page_code_write_restores_both_pages() {
+    let mut fixture = Fixture::spawn();
+    let target = fixture.multi_page_target();
+    let address = target.address.checked_add(1).expect("unaligned start");
+    let len = target.len.checked_sub(2).expect("range fits");
+    let second_address = target
+        .address
+        .checked_add(target.page_size as u64)
+        .expect("second page address");
+
+    let first_before = fixture
+        .process
+        .region_at(target.address)
+        .expect("first page region")
+        .expect("first page mapped");
+    let second_before = fixture
+        .process
+        .region_at(second_address)
+        .expect("second page region")
+        .expect("second page mapped");
+
+    let original = fixture
+        .process
+        .read_bytes(address, len)
+        .expect("read unaligned multi-page range");
+    fixture
+        .process
+        .write_code(address, &original)
+        .expect("unaligned multi-page code write");
+    assert_eq!(
+        fixture
+            .process
+            .read_bytes(address, len)
+            .expect("read range after write"),
+        original
+    );
+
+    let first_after = fixture
+        .process
+        .region_at(target.address)
+        .expect("first page region after write")
+        .expect("first page still mapped");
+    let second_after = fixture
+        .process
+        .region_at(second_address)
+        .expect("second page region after write")
+        .expect("second page still mapped");
+    assert_eq!(first_after.protection(), first_before.protection());
+    assert_eq!(second_after.protection(), second_before.protection());
 }
 
 #[cfg(windows)]

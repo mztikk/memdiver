@@ -35,8 +35,13 @@ impl Pattern {
         let mut anchor = None;
 
         for (index, token) in text.split_whitespace().enumerate() {
+            if bytes.len() == MAX_PATTERN_LEN {
+                return Err(Error::InvalidPattern {
+                    reason: format!("pattern is longer than {MAX_PATTERN_LEN} bytes"),
+                });
+            }
             let (byte, mask) = parse_token(token).map_err(|reason| Error::InvalidPattern {
-                reason: format!("token {} ({token:?}): {reason}", index + 1),
+                reason: format!("token {} ({:?}): {reason}", index + 1, token_preview(token)),
             })?;
             if anchor.is_none() && mask == 0xFF {
                 anchor = Some((bytes.len(), byte));
@@ -109,6 +114,16 @@ impl Pattern {
             .zip(haystack)
             .all(|((expected, mask), actual)| actual & mask == expected & mask)
     }
+}
+
+/// Shortens a malformed token before it is embedded in an error message.
+fn token_preview(token: &str) -> String {
+    const MAX_CHARS: usize = 32;
+    let mut preview: String = token.chars().take(MAX_CHARS).collect();
+    if token.len() > MAX_CHARS {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn parse_token(token: &str) -> std::result::Result<(u8, u8), String> {
@@ -234,6 +249,19 @@ mod tests {
             Pattern::parse(&text),
             Err(Error::InvalidPattern { .. })
         ));
+    }
+
+    #[test]
+    fn malformed_giant_tokens_do_not_echo_the_whole_token() {
+        let text = "Z".repeat(100_000);
+        let error = Pattern::parse(&text).expect_err("giant token must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.len() < 200,
+            "error message must stay short, got {} bytes",
+            message.len()
+        );
+        assert!(message.contains("..."), "{message}");
     }
 
     #[test]

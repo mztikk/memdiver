@@ -4,8 +4,15 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use memdiver::{Address, Process};
+
+/// Upper bound for the fixture handshake and every command response.
+const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Number of bytes in the fixture's buffer.
 pub const BUFFER_LEN: usize = 4096;
@@ -89,47 +96,122 @@ pub struct Fixture {
     pub len: usize,
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    lines: Receiver<String>,
+    reader: Option<JoinHandle<()>>,
+    exe_path: Option<std::path::PathBuf>,
 }
 
 impl Fixture {
     /// Starts a fixture and opens it through the public API.
     pub fn spawn() -> Self {
-        let mut child = Command::new(fixture_exe())
+        Self::spawn_from(fixture_exe(), None)
+    }
+
+    /// Starts a fixture from a uniquely named copy of the fixture binary.
+    ///
+    /// A test process can have several copies of itself with the same image
+    /// name (libtest may run tests in child processes), so opening "the current
+    /// test binary by name" is not deterministic. A uniquely named copy makes
+    /// the name-open path deterministic; the copy is removed on drop.
+    pub fn spawn_unique() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("memdiver-fixture-{}-{serial}", std::process::id());
+        let path = fixture_exe().with_file_name(&name);
+        std::fs::copy(fixture_exe(), &path).expect("copy fixture binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("fixture copy metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("make fixture copy executable");
+        }
+        Self::spawn_from(&path, Some(path.clone()))
+    }
+
+    /// Returns the executable name the fixture was started from.
+    pub fn name(&self) -> String {
+        self.exe_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(fixture_name)
+    }
+
+    fn spawn_from(exe: &Path, cleanup: Option<std::path::PathBuf>) -> Self {
+        let mut child = Command::new(exe)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn memdiver-fixture");
         let stdin = child.stdin.take().expect("fixture stdin");
-        let mut stdout = BufReader::new(child.stdout.take().expect("fixture stdout"));
+        let stdout = child.stdout.take().expect("fixture stdout");
+        let (lines, reader) = read_lines(stdout);
 
-        let mut ready = String::new();
-        let read = stdout
-            .read_line(&mut ready)
-            .expect("read fixture READY line");
-        if read == 0 {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("fixture exited before printing READY");
-        }
+        let ready = match lines.recv_timeout(FIXTURE_IO_TIMEOUT) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => abort_child(
+                &mut child,
+                reader,
+                "fixture did not print READY within the handshake timeout".to_owned(),
+            ),
+            Err(RecvTimeoutError::Disconnected) => abort_child(
+                &mut child,
+                reader,
+                "fixture exited before printing READY".to_owned(),
+            ),
+        };
 
         let fields: Vec<&str> = ready.split_whitespace().collect();
-        assert_eq!(fields.len(), 4, "unexpected READY line: {ready:?}");
-        assert_eq!(fields[0], "READY");
-        let pid: u32 = fields[1].parse().expect("fixture pid");
-        let address: u64 = fields[2].parse().expect("fixture buffer address");
-        let len: usize = fields[3].parse().expect("fixture buffer length");
-        assert_eq!(pid, child.id(), "fixture reported a different PID");
-        assert_eq!(len, BUFFER_LEN);
+        if fields.len() != 4 || fields[0] != "READY" {
+            abort_child(
+                &mut child,
+                reader,
+                format!("unexpected READY line: {ready:?}"),
+            );
+        }
+        let pid: u32 = match fields[1].parse() {
+            Ok(pid) => pid,
+            Err(_) => abort_child(
+                &mut child,
+                reader,
+                format!("invalid fixture pid in {ready:?}"),
+            ),
+        };
+        let address: u64 = match fields[2].parse() {
+            Ok(address) => address,
+            Err(_) => abort_child(
+                &mut child,
+                reader,
+                format!("invalid fixture address in {ready:?}"),
+            ),
+        };
+        let len: usize = match fields[3].parse() {
+            Ok(len) => len,
+            Err(_) => abort_child(
+                &mut child,
+                reader,
+                format!("invalid fixture length in {ready:?}"),
+            ),
+        };
+        if pid != child.id() || len != BUFFER_LEN {
+            abort_child(
+                &mut child,
+                reader,
+                format!("fixture reported inconsistent identity or length: {ready:?}"),
+            );
+        }
 
         let process = match Process::open(pid) {
             Ok(process) => process,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("could not open fixture process {pid}: {error}");
-            }
+            Err(error) => abort_child(
+                &mut child,
+                reader,
+                format!("could not open fixture process {pid}: {error}"),
+            ),
         };
 
         Self {
@@ -138,7 +220,9 @@ impl Fixture {
             len,
             child,
             stdin,
-            stdout,
+            lines,
+            reader: Some(reader),
+            exe_path: cleanup,
         }
     }
 
@@ -205,6 +289,37 @@ impl Fixture {
         }
     }
 
+    /// Returns the address of the fixture's executable `/dev/zero` mapping.
+    ///
+    /// Reading `/dev/zero` never reaches EOF, so this target proves that the
+    /// module-file reader rejects device files before reading them.
+    #[cfg(target_os = "linux")]
+    pub fn zero_target(&mut self) -> Address {
+        self.request("ZERO");
+        let response = self.response();
+        let fields: Vec<&str> = response.split_whitespace().collect();
+        assert_eq!(fields.len(), 2, "unexpected ZERO response: {response:?}");
+        assert_eq!(fields[0], "ZERO");
+        Address::new(fields[1].parse().expect("zero target address"))
+    }
+
+    /// Asks the fixture to exit without reaping it.
+    ///
+    /// This lets a test observe a zombie on Linux and a signaled process on
+    /// Windows; `Drop` still reaps the child.
+    pub fn exit(&mut self) {
+        self.request("EXIT");
+    }
+
+    /// Replaces the fixture image with itself.
+    ///
+    /// This keeps the PID and start time but installs a new address space, so
+    /// a handle opened before the call must report `AddressSpaceReplaced`.
+    #[cfg(target_os = "linux")]
+    pub fn exec(&mut self) {
+        self.request("EXEC");
+    }
+
     /// Kills and reaps the fixture process.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
@@ -217,20 +332,52 @@ impl Fixture {
     }
 
     fn response(&mut self) -> String {
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .expect("read fixture response");
-        assert_ne!(read, 0, "fixture closed stdout");
-        line.trim_end().to_owned()
+        match self.lines.recv_timeout(FIXTURE_IO_TIMEOUT) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("fixture did not respond within {FIXTURE_IO_TIMEOUT:?}")
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("fixture closed stdout"),
+        }
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.kill();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(path) = self.exe_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
+}
+
+fn read_lines(stdout: ChildStdout) -> (Receiver<String>, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if sender.send(line.trim_end().to_owned()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (receiver, reader)
+}
+
+fn abort_child(child: &mut Child, reader: JoinHandle<()>, message: String) -> ! {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    panic!("{message}");
 }
 
 fn decode_hex(encoded: &str) -> Vec<u8> {

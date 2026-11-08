@@ -1,6 +1,9 @@
 //! Pattern scanning across process memory.
 
+use std::mem::size_of;
+
 use memchr::memchr;
+use memdiver_sys::ErrorKind as OsErrorKind;
 
 use crate::{Address, Error, Module, Pattern, Process, Result, ScanOptions};
 
@@ -12,18 +15,21 @@ impl Process {
     ///
     /// Modules are searched in ascending load-address order, so the result is
     /// the first hit in module order. Only readable, non-guard regions inside
-    /// module bounds are scanned. Unreadable regions and failed chunk reads are
-    /// skipped; this makes the scan best-effort over a live process.
+    /// module bounds are scanned; adjacent readable regions are coalesced so a
+    /// pattern crossing a mapping boundary is still found. Unreadable regions
+    /// and ordinary failed chunk reads are skipped, while an exited or replaced
+    /// process aborts the scan.
     ///
     /// # Errors
     ///
     /// Returns an error when the module or region list cannot be enumerated.
     pub fn find_pattern(&self, pattern: &Pattern) -> Result<Option<Address>> {
         let modules = self.modules()?;
-        let regions = self.regions()?;
+        let regions = self.scan_regions()?;
         let options = ScanOptions::default();
+        let mut hits = Vec::new();
         for module in &modules {
-            let mut hits = Vec::new();
+            hits.clear();
             self.scan_module(module, &regions, pattern, &options, 1, &mut hits)?;
             if let Some(hit) = hits.first() {
                 return Ok(Some(*hit));
@@ -49,7 +55,7 @@ impl Process {
         let module = self.module(module)?.ok_or_else(|| Error::ModuleNotFound {
             name: module.to_owned(),
         })?;
-        let regions = self.regions()?;
+        let regions = self.scan_regions()?;
         let mut hits = Vec::new();
         self.scan_module(
             &module,
@@ -78,7 +84,7 @@ impl Process {
         options: &ScanOptions,
     ) -> Result<Vec<Address>> {
         let modules = self.modules()?;
-        let regions = self.regions()?;
+        let regions = self.scan_regions()?;
         let mut hits = Vec::new();
         let limit = result_limit(options);
         for module in &modules {
@@ -93,24 +99,22 @@ impl Process {
     /// Finds all occurrences of `pattern` in readable process memory.
     ///
     /// This scans every committed, readable, non-guard region, including heap,
-    /// stacks and modules. Results are returned in ascending address order and
-    /// bounded by [`ScanOptions::max_results`].
+    /// stacks and modules. Adjacent readable regions are coalesced so patterns
+    /// crossing a mapping boundary are found. Results are returned in ascending
+    /// address order and bounded by [`ScanOptions::max_results`].
     ///
     /// # Errors
     ///
     /// Returns an error when the region list cannot be enumerated or an output
     /// buffer cannot be allocated.
     pub fn find_patterns(&self, pattern: &Pattern, options: &ScanOptions) -> Result<Vec<Address>> {
-        let regions = self.regions()?;
+        let regions = self.scan_regions()?;
         let mut hits = Vec::new();
         let limit = result_limit(options);
-        for region in &regions {
-            if !scan_region(region) {
-                continue;
-            }
+        for range in scan_ranges(&regions, None) {
             scan_range_with(
-                region.base(),
-                region.size(),
+                range.base,
+                range.size,
                 pattern,
                 options,
                 limit,
@@ -142,7 +146,7 @@ impl Process {
         let module = self.module(module)?.ok_or_else(|| Error::ModuleNotFound {
             name: module.to_owned(),
         })?;
-        let regions = self.regions()?;
+        let regions = self.scan_regions()?;
         let mut hits = Vec::new();
         self.scan_module(
             &module,
@@ -164,18 +168,10 @@ impl Process {
         limit: usize,
         hits: &mut Vec<Address>,
     ) -> Result<()> {
-        for region in regions {
-            if !scan_region(region) {
-                continue;
-            }
-            let start = region.base().get().max(module.base().get());
-            let end = region.end().get().min(module.end().get());
-            if end <= start {
-                continue;
-            }
+        for range in scan_ranges(regions, Some(module)) {
             scan_range_with(
-                Address::new(start),
-                end - start,
+                range.base,
+                range.size,
                 pattern,
                 options,
                 limit,
@@ -192,6 +188,63 @@ impl Process {
 
 fn scan_region(region: &crate::Region) -> bool {
     region.is_readable() && !region.protection().is_guarded()
+}
+
+/// A contiguous range to scan, after merging adjacent readable regions and
+/// clipping to a module when one is supplied.
+struct ScanRange {
+    base: Address,
+    size: u64,
+}
+
+/// Builds the ranges a scan must read.
+///
+/// Adjacent readable regions are merged so a pattern that crosses a mapping
+/// boundary is still found; the underlying read works across adjacent mappings
+/// and the range stays inside readable memory. Module scans clip every region
+/// to the module span first.
+fn scan_ranges(regions: &[crate::Region], module: Option<&Module>) -> Vec<ScanRange> {
+    let mut ranges: Vec<ScanRange> = Vec::new();
+    for region in regions {
+        if !scan_region(region) {
+            continue;
+        }
+        let (start, end) = match module {
+            Some(module) => (
+                region.base().get().max(module.base().get()),
+                region.end().get().min(module.end().get()),
+            ),
+            None => (region.base().get(), region.end().get()),
+        };
+        if end <= start {
+            continue;
+        }
+        if let Some(last) = ranges.last_mut() {
+            let last_end = last.base.get().saturating_add(last.size);
+            if last_end == start {
+                last.size = last.size.saturating_add(end - start);
+                continue;
+            }
+        }
+        ranges.push(ScanRange {
+            base: Address::new(start),
+            size: end - start,
+        });
+    }
+    ranges
+}
+
+/// Returns `true` when a failed chunk read means the whole scan is invalid
+/// rather than merely unreadable memory.
+///
+/// Address-space replacement and process exit are terminal; an unmapped chunk,
+/// permission failure or short transfer is normal best-effort noise for a scan.
+fn is_fatal_scan_error(error: &Error) -> bool {
+    match error {
+        Error::AddressSpaceReplaced { .. } => true,
+        Error::Read { source, .. } => matches!(source.kind(), OsErrorKind::ProcessExited),
+        _ => false,
+    }
 }
 
 fn result_limit(options: &ScanOptions) -> usize {
@@ -251,8 +304,10 @@ where
         let Some(address) = base.checked_add(offset) else {
             break;
         };
-        if read(address, &mut buffer).is_ok() {
-            scan_buffer(&buffer, address, pattern, options, limit, hits);
+        match read(address, &mut buffer) {
+            Ok(()) => scan_buffer(&buffer, address, pattern, options, limit, hits)?,
+            Err(error) if is_fatal_scan_error(&error) => return Err(error),
+            Err(_) => {}
         }
         offset = offset.saturating_add(step_u64);
     }
@@ -266,10 +321,10 @@ fn scan_buffer(
     options: &ScanOptions,
     limit: usize,
     hits: &mut Vec<Address>,
-) {
+) -> Result<()> {
     let pattern_len = pattern.len();
     if pattern_len == 0 || pattern_len > buffer.len() {
-        return;
+        return Ok(());
     }
     let last_start = buffer.len() - pattern_len;
     let alignment = options.alignment().max(1) as u64;
@@ -293,13 +348,16 @@ fn scan_buffer(
             search
         };
 
-        let Some(absolute) = base_value.checked_add(u64::try_from(candidate).unwrap_or(u64::MAX))
-        else {
+        let Some(absolute) = base_value.checked_add(candidate as u64) else {
             break;
         };
         if (alignment == 1 || absolute % alignment == 0)
             && pattern.matches_at(&buffer[candidate..candidate + pattern_len])
         {
+            hits.try_reserve(1).map_err(|source| Error::Allocation {
+                len: size_of::<Address>().saturating_mul(hits.len().saturating_add(1)),
+                source,
+            })?;
             hits.push(Address::new(absolute));
             if hits.len() >= limit {
                 break;
@@ -307,15 +365,18 @@ fn scan_buffer(
         }
         search = candidate + 1;
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Protection, RegionKind};
 
     const BASE: u64 = 0x1000;
 
-    fn run_scan(
+    fn run_scan_at(
+        base: u64,
         data: &[u8],
         pattern: &Pattern,
         options: &ScanOptions,
@@ -323,14 +384,14 @@ mod tests {
     ) -> Vec<Address> {
         let mut hits = Vec::new();
         scan_range_with(
-            Address::new(BASE),
+            Address::new(base),
             data.len() as u64,
             pattern,
             options,
             limit,
             &mut hits,
             |address, buffer| {
-                let offset = usize::try_from(address.get() - BASE).expect("offset");
+                let offset = usize::try_from(address.get() - base).expect("offset");
                 buffer.copy_from_slice(&data[offset..offset + buffer.len()]);
                 Ok(())
             },
@@ -339,15 +400,92 @@ mod tests {
         hits
     }
 
+    fn run_scan(
+        data: &[u8],
+        pattern: &Pattern,
+        options: &ScanOptions,
+        limit: usize,
+    ) -> Vec<Address> {
+        run_scan_at(BASE, data, pattern, options, limit)
+    }
+
+    fn test_region(base: u64, size: u64, protection: Protection) -> crate::Region {
+        crate::Region::from_raw(memdiver_sys::RawRegion {
+            base,
+            size,
+            protection,
+            kind: RegionKind::Private,
+            path: None,
+        })
+    }
+
+    #[test]
+    fn scan_ranges_merge_adjacent_readable_regions() {
+        let regions = vec![
+            test_region(0x1000, 0x1000, Protection::READ),
+            test_region(0x2000, 0x1000, Protection::READ | Protection::WRITE),
+            // A gap breaks the run.
+            test_region(0x4000, 0x1000, Protection::READ),
+            // An unreadable region is skipped and also breaks the run.
+            test_region(0x5000, 0x1000, Protection::empty()),
+            test_region(0x6000, 0x1000, Protection::READ),
+        ];
+        let ranges = scan_ranges(&regions, None);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].base, Address::new(0x1000));
+        assert_eq!(ranges[0].size, 0x2000);
+        assert_eq!(ranges[1].base, Address::new(0x4000));
+        assert_eq!(ranges[1].size, 0x1000);
+        assert_eq!(ranges[2].base, Address::new(0x6000));
+        assert_eq!(ranges[2].size, 0x1000);
+    }
+
+    #[test]
+    fn scan_ranges_clip_to_a_module_before_merging() {
+        let module = Module::from_raw(memdiver_sys::RawModule {
+            name: "test".to_owned(),
+            path: std::path::PathBuf::from("/test"),
+            base: 0x1800,
+            size: 0x1000,
+        });
+        let regions = vec![
+            test_region(0x1000, 0x1000, Protection::READ),
+            test_region(0x2000, 0x1000, Protection::READ),
+        ];
+        let ranges = scan_ranges(&regions, Some(&module));
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].base, Address::new(0x1800));
+        assert_eq!(ranges[0].size, 0x1000);
+    }
+
     #[test]
     fn finds_pattern_across_chunk_boundary() {
-        let mut data = vec![0u8; SCAN_CHUNK + 64];
+        // The first chunk covers [0, SCAN_CHUNK + pattern_len - 1). Placing the
+        // match at SCAN_CHUNK + 2 makes it spill past the first chunk, so only
+        // the second chunk (which starts at SCAN_CHUNK) can find it. This
+        // exercises the step/dedup path rather than the intra-chunk path.
+        let mut data = vec![0u8; SCAN_CHUNK * 2 + 64];
         let pattern = Pattern::parse("DE AD BE EF 11 22 33 44").expect("pattern");
-        let position = SCAN_CHUNK - 3;
+        let position = SCAN_CHUNK + 2;
         data[position..position + 8]
             .copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22, 0x33, 0x44]);
         let hits = run_scan(&data, &pattern, &ScanOptions::default(), 10);
         assert_eq!(hits, vec![Address::new(BASE + position as u64)]);
+    }
+
+    #[test]
+    fn alignment_uses_the_absolute_address() {
+        let mut data = [0u8; 16];
+        data[5] = 0xAA;
+        data[6] = 0xAA;
+        let pattern = Pattern::parse("AA").expect("pattern");
+        let options = ScanOptions::new().with_alignment(4);
+        let hits = run_scan_at(0x1003, &data, &pattern, &options, 10);
+        assert_eq!(
+            hits,
+            vec![Address::new(0x1008)],
+            "0x1008 is 4-aligned; 0x1009 is not"
+        );
     }
 
     #[test]

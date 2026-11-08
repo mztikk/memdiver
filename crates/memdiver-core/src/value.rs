@@ -10,7 +10,8 @@ impl Process {
     /// The value is encoded in native byte order and scanned with the supplied
     /// options. Set [`ScanOptions::with_alignment`] to the type's alignment (or
     /// its size) to avoid unaligned false positives. Zero-sized values cannot
-    /// be scanned.
+    /// be scanned, and a value larger than the one-mebibyte pattern limit is
+    /// rejected as [`Error::InvalidPattern`](crate::Error::InvalidPattern).
     ///
     /// # Errors
     ///

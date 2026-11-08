@@ -71,6 +71,47 @@ fn detects_pointer_width_and_resolves_chains() {
 }
 
 #[test]
+fn reads_32_bit_pointers_on_any_host() {
+    let fixture = Fixture::spawn();
+    let slot = fixture.address.checked_add(0x120).expect("slot");
+    fixture
+        .process
+        .write_value(slot, 0x1000u32)
+        .expect("write 32-bit pointer");
+    assert_eq!(
+        fixture
+            .process
+            .read_pointer(slot, PointerWidth::Bits32)
+            .expect("read 32-bit pointer"),
+        Address::new(0x1000)
+    );
+    assert_eq!(
+        fixture
+            .process
+            .resolve_pointer_chain(slot, &[0x10], PointerWidth::Bits32)
+            .expect("32-bit chain"),
+        Address::new(0x1010)
+    );
+}
+
+#[test]
+fn pointer_chain_null_pointer_is_reported() {
+    let fixture = Fixture::spawn();
+    let width = fixture.process.pointer_width().expect("pointer width");
+    let slot = fixture.address.checked_add(0x740).expect("slot");
+    write_pointer(&fixture.process, slot, Address::NULL, width).expect("write null pointer");
+
+    let error = fixture
+        .process
+        .resolve_pointer_chain(slot, &[0x10], width)
+        .expect_err("a null chain must fail");
+    assert!(
+        matches!(error, Error::PointerChainNull { .. }),
+        "unexpected {error:?}"
+    );
+}
+
+#[test]
 fn pointer_chain_overflow_is_reported() {
     let fixture = Fixture::spawn();
     let width = fixture.process.pointer_width().expect("pointer width");

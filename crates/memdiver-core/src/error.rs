@@ -3,7 +3,7 @@
 use memdiver_sys::Error as OsError;
 use memdiver_sys::ErrorKind as OsErrorKind;
 
-use crate::{Address, ProcessInfo, Protection};
+use crate::{Address, Module, ProcessInfo, Protection};
 
 /// The error type returned by all memory operations.
 ///
@@ -108,6 +108,23 @@ pub enum Error {
         transferred: usize,
     },
 
+    /// The target replaced its address space (for example with `execve`).
+    ///
+    /// The PID and start time are unchanged, so the process is still the one
+    /// that was opened, but the pinned Linux memory descriptor refers to the
+    /// previous address space. Open a new handle to access the new image.
+    #[error(
+        "process {pid} replaced its address space before accessing {len} bytes at {address}; reopen the process"
+    )]
+    AddressSpaceReplaced {
+        /// PID of the target process.
+        pid: u32,
+        /// Address that was being accessed.
+        address: Address,
+        /// Number of bytes requested.
+        len: usize,
+    },
+
     /// Enumerating memory regions or modules failed.
     #[error("failed to enumerate {what} for process {pid}: {source}")]
     Enumerate {
@@ -144,8 +161,10 @@ pub enum Error {
     },
 
     /// The address range is invalid because it overflows the address space.
-    #[error("address range starting at {address} with length {len} is invalid")]
+    #[error("address range starting at {address} with length {len} is invalid in process {pid}")]
     AddressRange {
+        /// PID of the target process.
+        pid: u32,
         /// Start of the range.
         address: Address,
         /// Length of the range.
@@ -162,8 +181,16 @@ pub enum Error {
     },
 
     /// The requested protection cannot be represented by the platform.
-    #[error("protection {protection} cannot be applied to process memory")]
+    #[error(
+        "protection {protection} cannot be applied to {len} bytes at {address} in process {pid}"
+    )]
     InvalidProtection {
+        /// PID of the target process.
+        pid: u32,
+        /// Start of the range.
+        address: Address,
+        /// Length of the range.
+        len: usize,
         /// Protection that was requested.
         protection: Protection,
         /// Underlying operating-system error.
@@ -172,7 +199,7 @@ pub enum Error {
     },
 
     /// Allocating a buffer for a read failed.
-    #[error("could not allocate a {len}-byte read buffer")]
+    #[error("could not allocate a {len}-byte buffer")]
     Allocation {
         /// Number of bytes requested.
         len: usize,
@@ -228,9 +255,9 @@ pub enum Error {
         module: String,
         /// Path that was read.
         path: std::path::PathBuf,
-        /// Filesystem error.
+        /// Underlying operating-system error.
         #[source]
-        source: std::io::Error,
+        source: OsError,
     },
 
     /// A module file could not be parsed for export resolution.
@@ -240,6 +267,29 @@ pub enum Error {
         module: String,
         /// Description of the parse or format failure.
         reason: String,
+    },
+
+    /// A module file's format could not be parsed; the parser error is retained.
+    #[error("failed to parse exports for module {module:?}: {reason}")]
+    ModuleParse {
+        /// Module that was being parsed.
+        module: String,
+        /// Description of the parse failure.
+        reason: String,
+        /// Underlying parser error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A module name matches more than one loaded module.
+    #[error(
+        "module name {name:?} matches multiple modules; use a module handle or a more specific name"
+    )]
+    AmbiguousModuleName {
+        /// Name that was requested.
+        name: String,
+        /// Matching modules, sorted by load address.
+        candidates: Vec<Module>,
     },
 
     /// Waiting for the process failed.
@@ -338,6 +388,15 @@ pub enum Error {
         additional_restore_failures: usize,
     },
 
+    /// A pointer chain read a null pointer.
+    #[error("pointer chain at {address} in process {pid} read a null pointer")]
+    PointerChainNull {
+        /// PID of the target process.
+        pid: u32,
+        /// Address of the slot that contained the null pointer.
+        address: Address,
+    },
+
     /// A pointer chain overflowed the target's address width.
     #[error("pointer chain overflow at {address} while adding {offset:#x} in process {pid}")]
     PointerChainOverflow {
@@ -427,7 +486,7 @@ mod tests {
             len: usize::MAX,
             source,
         };
-        assert!(error.to_string().contains("read buffer"));
+        assert!(error.to_string().contains("buffer"));
     }
 
     #[test]
@@ -444,6 +503,7 @@ mod tests {
         // test focuses on composition and formatting, so a structural error
         // with a page address stands in for the restore failure.
         let restore = Error::AddressRange {
+            pid: 42,
             address: Address::new(0x2000),
             len: 0x1000,
         };
@@ -470,6 +530,7 @@ mod tests {
         // fail only during restoration, so the composite construction and
         // formatting is covered here rather than in an end-to-end test.
         let restore = Error::AddressRange {
+            pid: 42,
             address: Address::new(0x3000),
             len: 0x1000,
         };

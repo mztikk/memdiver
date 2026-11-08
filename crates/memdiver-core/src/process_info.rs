@@ -31,8 +31,9 @@ impl ProcessInfo {
     ///
     /// This is normally the executable file name. On Linux it comes from the
     /// executable link when available and falls back to `/proc/<pid>/comm`.
-    /// Non-UTF-8 Linux names and invalid UTF-16 Windows names are converted
-    /// lossily; use [`ProcessInfo::exe_path`] when exact bytes matter.
+    /// Names that are not valid Unicode are converted lossily (including
+    /// invalid UTF-16 on Windows); use [`ProcessInfo::exe_path`] when exact
+    /// path bytes matter. Windows paths are preserved as WTF-16.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

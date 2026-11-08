@@ -37,13 +37,25 @@ fn lists_processes_and_opens_the_current_process_by_name() {
         Some(expected_name.clone())
     );
 
-    let opened = Process::open_by_name(&expected_name).expect("open current process by name");
-    assert_eq!(opened.pid(), std::process::id());
+    // Libtest can run each test in a child process, so the test binary's own
+    // image name is not unique. Use a uniquely named fixture copy for the
+    // open-by-name path so the assertion is deterministic.
+    let fixture = Fixture::spawn_unique();
+    let unique_name = fixture.name();
+    let candidates = Process::find_by_name(&unique_name).expect("find unique fixture");
+    assert!(
+        candidates
+            .iter()
+            .any(|process| process.pid() == fixture.process.pid()),
+        "the uniquely named fixture must be listed"
+    );
+    let opened = Process::open_by_name(&unique_name).expect("open unique fixture by name");
+    assert_eq!(opened.pid(), fixture.process.pid());
     assert!(opened.is_writable());
     assert_eq!(opened.access(), ProcessAccess::ReadWrite);
     assert_eq!(
         opened.name().expect("process name").as_deref(),
-        Some(expected_name.as_str())
+        Some(unique_name.as_str())
     );
 }
 
@@ -112,7 +124,8 @@ fn duplicate_process_names_are_reported_as_ambiguous() {
 
 #[test]
 fn read_only_handles_can_read_but_not_write_or_protect() {
-    let fixture = Fixture::spawn();
+    let mut fixture = Fixture::spawn();
+    let before = fixture.peek_all();
     let readonly = Process::open_readonly(fixture.process.pid()).expect("read-only open");
     assert!(!readonly.is_writable());
     assert_eq!(readonly.access(), ProcessAccess::ReadOnly);
@@ -133,10 +146,10 @@ fn read_only_handles_can_read_but_not_write_or_protect() {
     let error = readonly
         .write_value(fixture.address, 1u32)
         .expect_err("read-only typed write must fail");
-    assert!(
-        matches!(error, Error::ReadOnly { .. }),
-        "unexpected {error:?}"
-    );
+    match error {
+        Error::ReadOnly { operation, .. } => assert_eq!(operation, "Process::write_value"),
+        other => panic!("unexpected {other:?}"),
+    }
 
     let error = readonly
         .protect(fixture.address, 16, Protection::READ)
@@ -146,10 +159,23 @@ fn read_only_handles_can_read_but_not_write_or_protect() {
         "unexpected {error:?}"
     );
 
+    let error = readonly
+        .protect(fixture.address, 0, Protection::READ)
+        .expect_err("a read-only handle must reject protect even for an empty range");
+    assert!(
+        matches!(error, Error::ReadOnly { .. }),
+        "unexpected {error:?}"
+    );
+
     let empty = [];
     readonly
         .write(fixture.address, &empty)
         .expect("zero-length write is a no-op");
+    assert_eq!(
+        fixture.peek_all(),
+        before,
+        "rejected read-only operations must not modify the target"
+    );
 }
 
 #[test]

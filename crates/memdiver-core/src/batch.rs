@@ -13,7 +13,13 @@ impl Process {
     ///
     /// Returns [`Error::BatchRead`] when any entry fails.
     pub fn read_many(&self, ranges: &[(Address, usize)]) -> Result<Vec<Vec<u8>>> {
-        let mut results = Vec::with_capacity(ranges.len());
+        let mut results = Vec::new();
+        results
+            .try_reserve(ranges.len())
+            .map_err(|source| Error::Allocation {
+                len: ranges.len().saturating_mul(std::mem::size_of::<Vec<u8>>()),
+                source,
+            })?;
         for (index, (address, len)) in ranges.iter().enumerate() {
             let bytes = self
                 .read_bytes(*address, *len)

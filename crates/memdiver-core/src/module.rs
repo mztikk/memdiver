@@ -32,9 +32,9 @@ impl Module {
 
     /// Returns the module name reported by the platform.
     ///
-    /// This is normally the file name. Linux file names that are not valid
-    /// UTF-8 are converted lossily; use [`Module::path`] when the exact bytes
-    /// matter.
+    /// This is normally the file name. Names that are not valid Unicode are
+    /// converted lossily on both platforms; use [`Module::path`] when the exact
+    /// bytes matter.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -73,6 +73,52 @@ impl Module {
     }
 }
 
+/// A snapshot of a process's loaded modules with binary-search lookups.
+///
+/// Use this when looking up more than one address: [`crate::Process::module_at`]
+/// re-enumerates the process for every call, while a `ModuleMap` enumerates
+/// once. The snapshot is stale as soon as it is created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleMap {
+    modules: Vec<Module>,
+}
+
+impl ModuleMap {
+    pub(crate) fn new(modules: Vec<Module>) -> Self {
+        Self { modules }
+    }
+
+    /// Returns all modules, sorted by load address.
+    #[must_use]
+    pub fn modules(&self) -> &[Module] {
+        &self.modules
+    }
+
+    /// Returns the module containing `address`, if any.
+    #[must_use]
+    pub fn find(&self, address: Address) -> Option<&Module> {
+        let index = self
+            .modules
+            .partition_point(|module| module.base() <= address);
+        index
+            .checked_sub(1)
+            .and_then(|index| self.modules.get(index))
+            .filter(|module| module.contains(address))
+    }
+
+    /// Returns `true` when the snapshot contains no modules.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+
+    /// Returns the number of modules in the snapshot.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.modules.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +140,19 @@ mod tests {
         assert_eq!(module.base(), Address::new(0x4000));
         assert_eq!(module.size(), 0x1000);
         assert_eq!(module.end(), Address::new(0x5000));
+    }
+
+    #[test]
+    fn map_finds_modules_by_address() {
+        let map = ModuleMap::new(vec![module()]);
+        assert_eq!(map.len(), 1);
+        assert!(!map.is_empty());
+        assert_eq!(
+            map.find(Address::new(0x4000)).map(Module::name),
+            Some("example.so")
+        );
+        assert!(map.find(Address::new(0x5000)).is_none());
+        assert_eq!(map.modules().len(), 1);
     }
 
     #[test]

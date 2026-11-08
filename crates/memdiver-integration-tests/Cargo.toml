@@ -13,6 +13,9 @@ publish = false
 name = "memdiver-fixture"
 path = "src/bin/memdiver-fixture.rs"
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 

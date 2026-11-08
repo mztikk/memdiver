@@ -46,7 +46,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns read errors for unreadable slots and
+    /// Returns read errors for unreadable slots, [`Error::PointerChainNull`]
+    /// when a slot contains a null pointer, and
     /// [`Error::PointerChainOverflow`] when an addition exceeds the target's
     /// pointer width.
     pub fn resolve_pointer_chain(
@@ -58,6 +59,12 @@ impl Process {
         let mut current = base;
         for offset in offsets {
             let pointer = self.read_pointer(current, width)?;
+            if pointer.is_null() {
+                return Err(Error::PointerChainNull {
+                    pid: self.pid,
+                    address: current,
+                });
+            }
             current = checked_pointer_add(width, pointer, *offset).ok_or(
                 Error::PointerChainOverflow {
                     pid: self.pid,

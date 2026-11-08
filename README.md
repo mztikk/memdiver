@@ -79,7 +79,8 @@ does not provide yet.
   `/proc/<pid>/mem` write because protection changes are not needed.
 * **No silent truncation.** A read or write that transfers fewer bytes than
   requested returns `Error::PartialRead` / `Error::PartialWrite` with both
-  counts. Nothing is quietly shortened.
+  counts. Nothing is quietly shortened. A stale Linux descriptor after a target
+  exec is reported as `Error::AddressSpaceReplaced`, never as an empty scan.
 * **Errors with context.** Operating-system failures identify the process,
   address, and length where those apply, and keep the original OS error as the
   `source()`. Raw `errno` / `GetLastError` values are available through
@@ -210,7 +211,9 @@ fn main() -> Result<(), memdiver::Error> {
 | `Process::read_bytes` | Allocate and read a byte range. |
 | `Process::read_value` / `write_value` | Typed `Pod` transfers. |
 | `Process::regions` / `region_at` | Committed regions and address lookup. |
+| `Process::region_map` / `RegionMap` | Sorted snapshot with binary-search lookups for repeated address queries. |
 | `Process::modules` / `module` / `module_at` | Loaded executable modules and address lookup. |
+| `Process::module_map` / `ModuleMap` | Sorted snapshot with binary-search lookups for repeated module queries. |
 | `Process::find_pattern` | First match across every loaded module. |
 | `Process::find_patterns` | All matches across readable memory. |
 | `Process::find_pattern_in_module` / `find_patterns_in_module` / `find_patterns_in_modules` | Module-scoped scans. |
@@ -219,7 +222,7 @@ fn main() -> Result<(), memdiver::Error> {
 | `Process::find_values` / `find_values_in_modules` / `find_values_in_module` | Search for typed values. |
 | `Process::read_many` / `write_many` | Batched transfers with indexed errors. |
 | `Process::wait_for_exit` | Block with an optional timeout until the process exits. |
-| `Process::module_exports` / `module_export` | Named PE/ELF exports resolved to live addresses. |
+| `Process::module_exports` / `module_export` | Named PE/ELF exports resolved to live addresses; the `_of` variants take a `Module` and are unambiguous. |
 | `enable_debug_privilege()` | Opt-in Windows `SeDebugPrivilege` helper (Linux: unsupported). |
 | `Process::protect` | Change page protection (Windows only). |
 | `Address` | `u64` target address with checked arithmetic and hex formatting. |
@@ -268,8 +271,9 @@ with process, address, and range context.
 * Regions are parsed from `/proc/<pid>/maps`; paths are raw bytes and may be
   non-UTF-8. A deleted suffix (`" (deleted)"`) is removed.
 * Modules are file-backed mappings with at least one executable segment. All
-  segments of the same file are merged. Anonymous executable mappings are not
-  modules.
+  segments of the same `(device, inode)` are merged; distinct files that share a
+  path (for example a deleted mapping and its replacement) are separate modules.
+  Anonymous executable mappings are not modules.
 * Process enumeration reads `/proc`, preferring the executable file name and
   falling back to `/proc/<pid>/comm`. Names match case-sensitively.
 * Pointer width comes from the ELF class of `/proc/<pid>/exe`.
@@ -279,6 +283,10 @@ with process, address, and range context.
 * ELF exports are read from the module file, filtered to defined global/weak
   default/protected dynamic symbols, and rebased using the ELF type
   (`ET_DYN`: module base + symbol value; `ET_EXEC`: absolute symbol value).
+  The file is opened through `/proc/<pid>/root` (the target's mount namespace),
+  its inode must still match the mapping, and the read is bounded to a regular
+  file of at most 1 GiB. ELF dynamic symbols come from the dynamic segment;
+  symbol-version information additionally needs the version sections.
 * `wait_for_exit` blocks in `poll` on a pidfd, so an idle wait causes no
   periodic wakeups. Kernels before 5.3, or hosts whose seccomp policy denies
   `pidfd_open`, fall back to polling `/proc/<pid>/stat` at 10 ms intervals with
@@ -286,8 +294,15 @@ with process, address, and range context.
 * The process start time from `/proc/<pid>/stat` is captured at open time and
   compared on later queries, so a reused PID is not mistaken for the original
   process. Zombies are reported as not alive.
+* The pinned `/proc/<pid>/mem` descriptor refers to the address space at open
+  time. A target `execve` keeps the PID and start time but installs a new
+  address space; subsequent reads return `Error::AddressSpaceReplaced`. Open a
+  new handle after an exec. Scans propagate this error instead of returning an
+  empty best-effort result.
 * `/proc/<pid>/mem` offsets are signed 64-bit values. Addresses or ranges above
   `i64::MAX` are rejected as invalid rather than wrapped.
+* Reading an unmapped address is reported as `ErrorKind::InvalidAddress` (the
+  raw `EIO` is preserved), matching the Windows `ERROR_INVALID_ADDRESS` class.
 * Linux has no API for changing another process's page protections;
   `Process::protect` returns `Error::Unsupported`. `Process::write_code` still
   works: it writes through `/proc/<pid>/mem` and skips the protection step. It
@@ -331,7 +346,7 @@ cat /proc/sys/kernel/yama/ptrace_scope
 * Process enumeration uses a Tool Help process snapshot; image paths and
   metadata are queried with limited-rights handles where possible. Names match
   ASCII case-insensitively.
-* Pointer width uses `IsWow64Process`.
+* Pointer width uses `IsWow64Process2`, falling back to `IsWow64Process` on older systems.
 * Pattern scans skip unreadable and guard regions and skip failed chunk reads.
 * `Process::protect` uses `VirtualProtectEx` and returns the previous protection
   of the first page in the range. A multi-page range can contain pages with
@@ -393,11 +408,15 @@ required.
 * The library never attaches a debugger, suspends threads, or injects code.
 * Pattern and value scans are best-effort snapshots of live memory: unreadable
   regions and failed chunk reads are skipped, and there is no
-  cancellation/progress API yet.
+  cancellation/progress API yet. A replaced address space or an exited process
+  is fatal and is reported instead of being treated as "not found".
 * Module exports are parsed from the module file reported by the OS, not from
   the live mapped image. A deleted or replaced file, or PE forwarders and
-  unnamed ordinal exports, can make the result incomplete or unavailable. ELF
-  discovery currently relies on section headers being present.
+  unnamed ordinal exports, can make the result incomplete or unavailable. On
+  Linux the file is resolved in the target's mount namespace and the inode is
+  checked; on Windows the path is opened in the caller's namespace. ELF dynamic
+  symbols are read from the dynamic segment; symbol-version information needs
+  the version sections, which a stripped file may lack.
 * Batched transfers are sequential under the hood; they do not currently use
   scatter/gather syscalls.
 * Linux wait-for-exit uses a pidfd where available and falls back to 10 ms

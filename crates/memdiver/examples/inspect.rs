@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => std::process::id(),
     };
 
-    let process = Process::open(pid)?;
+    let process = Process::open_readonly(pid)?;
     println!("process {pid} (alive: {})", process.is_alive());
 
     let regions = process.regions()?;

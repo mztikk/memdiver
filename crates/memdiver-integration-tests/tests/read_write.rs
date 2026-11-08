@@ -173,6 +173,15 @@ fn reports_unmapped_reads_and_writes_with_context() {
         .read_bytes(unmapped, 16)
         .expect_err("address 1 must not be readable");
     assert!(matches!(error, Error::Read { .. }), "unexpected {error:?}");
+    #[cfg(target_os = "linux")]
+    match &error {
+        Error::Read { source, .. } => assert_eq!(
+            source.kind(),
+            memdiver::OsErrorKind::InvalidAddress,
+            "an unmapped Linux address must be classified as InvalidAddress"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
     let message = error.to_string();
     assert!(message.contains("process"), "{message}");
     assert!(message.contains("0x1"), "{message}");
@@ -303,7 +312,8 @@ fn batch_errors_identify_the_failing_entry() {
 
 #[test]
 fn read_only_batch_writes_are_rejected() {
-    let fixture = Fixture::spawn();
+    let mut fixture = Fixture::spawn();
+    let before = fixture.peek_all();
     let readonly = Process::open_readonly(fixture.process.pid()).expect("read-only open");
     let error = readonly
         .write_many(&[(fixture.address, b"nope")])
@@ -315,4 +325,9 @@ fn read_only_batch_writes_are_rejected() {
     readonly
         .write_many(&[(fixture.address, b"")])
         .expect("zero-length batch write is a no-op");
+    assert_eq!(
+        fixture.peek_all(),
+        before,
+        "a rejected read-only batch must not modify the target"
+    );
 }
