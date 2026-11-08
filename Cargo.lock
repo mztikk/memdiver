@@ -45,14 +45,14 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memdiver"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "memdiver-core",
 ]
 
 [[package]]
 name = "memdiver-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "goblin",
@@ -63,14 +63,15 @@ dependencies = [
 
 [[package]]
 name = "memdiver-integration-tests"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "memdiver",
+ "windows-sys",
 ]
 
 [[package]]
 name = "memdiver-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags",
  "libc",

@@ -10,6 +10,9 @@
 //! * `READY <pid> <address> <length>` — first line written by the fixture.
 //! * `PING` → `PONG`
 //! * `PEEK <offset> <length>` → lowercase hexadecimal bytes
+//! * `CODE` → `CODE <address> <length>` for the executable code target
+//! * `MULTI` (Windows only) → `MULTI <address> <length> <page_size>` for the
+//!   two-page allocation with differing protections
 //! * `EXIT` → the fixture exits
 //!
 //! Invalid commands or ranges produce `ERR`.
@@ -20,6 +23,107 @@ use std::io::{self, BufRead, Write};
 const BUFFER_LEN: usize = 4096;
 const MULTIPLIER: u8 = 37;
 const ADDEND: u8 = 11;
+
+/// Number of executable bytes exposed by the `CODE` command.
+///
+/// The parent writes these bytes back unchanged, so a failed protection
+/// restore cannot change the fixture's behaviour.
+const CODE_LEN: usize = 4;
+
+/// A never-called function whose entry point lives in the fixture image's
+/// executable section.
+///
+/// The parent patches its existing bytes back through `Process::write_code`;
+/// taking its address keeps it in the image.
+#[inline(never)]
+fn code_target() -> u64 {
+    std::hint::black_box(0x5EED_1234_ABCD_0001_u64)
+}
+
+/// A Windows-only two-page allocation with different initial protections.
+///
+/// The address is exposed through `MULTI`. The allocation is intentionally kept
+/// for the process lifetime and is never executed.
+#[cfg(windows)]
+struct MultiPageTarget {
+    base: *mut std::ffi::c_void,
+    len: usize,
+    page_size: usize,
+}
+
+#[cfg(windows)]
+fn multi_page_target() -> MultiPageTarget {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
+        PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    // SAFETY: SYSTEM_INFO is a plain-old-data Win32 struct; all-zero is a valid
+    // initial value.
+    let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: GetSystemInfo writes a SYSTEM_INFO to the provided pointer.
+    unsafe { GetSystemInfo(&mut info) };
+    let page_size = info.dwPageSize as usize;
+    assert!(page_size > 0, "GetSystemInfo returned a zero page size");
+    let len = page_size.checked_mul(2).expect("two pages fit in usize");
+
+    // SAFETY: a null base asks the OS to choose a page-aligned range. The
+    // returned pointer is checked for null and owns `len` writable bytes.
+    let base = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            len,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    assert!(
+        !base.is_null(),
+        "VirtualAlloc failed for the multi-page target"
+    );
+
+    let bytes = pattern(len);
+    // SAFETY: `base` is a valid writable allocation of `len` bytes and `bytes`
+    // contains exactly `len` initialized bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.cast::<u8>(), len);
+    }
+
+    let mut previous: PAGE_PROTECTION_FLAGS = 0;
+    // SAFETY: `base` is the first page of the writable allocation and
+    // `previous` is writable for one value.
+    let first = unsafe {
+        VirtualProtect(
+            base as *const std::ffi::c_void,
+            page_size,
+            PAGE_EXECUTE_READ,
+            &mut previous,
+        )
+    };
+    assert_ne!(first, 0, "VirtualProtect failed for the first page");
+
+    let second_address = (base as usize)
+        .checked_add(page_size)
+        .expect("two-page allocation address fits in usize");
+    // SAFETY: `second_address` is the second page of the allocation and
+    // `previous` is writable for one value.
+    let second = unsafe {
+        VirtualProtect(
+            second_address as *const std::ffi::c_void,
+            page_size,
+            PAGE_READONLY,
+            &mut previous,
+        )
+    };
+    assert_ne!(second, 0, "VirtualProtect failed for the second page");
+
+    MultiPageTarget {
+        base,
+        len,
+        page_size,
+    }
+}
 
 /// Keep this byte-for-byte in sync with `MODULE_SIGNATURE` in the test harness.
 #[used]
@@ -47,6 +151,9 @@ fn main() -> io::Result<()> {
     std::hint::black_box(&MODULE_SIGNATURE);
 
     let buffer = pattern(BUFFER_LEN);
+    let code_address = code_target as *const () as usize;
+    #[cfg(windows)]
+    let multi_page = multi_page_target();
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -65,6 +172,13 @@ fn main() -> io::Result<()> {
         let mut fields = line.split_whitespace();
         match fields.next() {
             Some("PING") => writeln!(output, "PONG")?,
+            Some("CODE") => writeln!(output, "CODE {code_address} {CODE_LEN}")?,
+            #[cfg(windows)]
+            Some("MULTI") => writeln!(
+                output,
+                "MULTI {} {} {}",
+                multi_page.base as usize, multi_page.len, multi_page.page_size
+            )?,
             Some("PEEK") => {
                 let offset = fields.next().and_then(|value| value.parse::<usize>().ok());
                 let len = fields.next().and_then(|value| value.parse::<usize>().ok());

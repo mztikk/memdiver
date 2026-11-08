@@ -23,6 +23,7 @@ or real cross-process integration tests.
 | Read-only process handles | yes | yes |
 | Read bytes at an address | yes | yes |
 | Write bytes at an address | yes | yes |
+| Scoped code write with protection restore | yes | yes |
 | Typed `Pod` reads and writes (unaligned safe) | yes | yes |
 | Enumerate committed memory regions | yes | yes |
 | Look up the region containing an address | yes | yes |
@@ -41,6 +42,11 @@ or real cross-process integration tests.
 | Module exports (PE / ELF) | yes | yes |
 | Detect target exit | yes | yes |
 | PID reuse cannot redirect access | yes | yes |
+
+`Process::write_code` is available on Linux and Windows. Its instruction-cache
+coherence guarantee is limited to x86/x86_64: on other architectures, including
+ARM64, patched code may not be observed without a cache flush, which the library
+does not provide yet.
 
 ## Design highlights
 
@@ -65,6 +71,12 @@ or real cross-process integration tests.
   opt in to enabling `SeDebugPrivilege`.
 * **Read-only handles.** Open with `ProcessAccess::ReadOnly` when writes are not
   needed; write and protection operations are rejected before any OS call.
+* **Scoped code writes.** `Process::write_code` writes a code patch while
+  temporarily making the covering pages writable. On Windows each page's exact
+  previous protection is captured and restored on every exit path, even when the
+  write or a later protection change fails; restoration failures are reported
+  as composite errors that keep both failures. On Linux the helper is a normal
+  `/proc/<pid>/mem` write because protection changes are not needed.
 * **No silent truncation.** A read or write that transfers fewer bytes than
   requested returns `Error::PartialRead` / `Error::PartialWrite` with both
   counts. Nothing is quietly shortened.
@@ -89,7 +101,7 @@ The crates are published on crates.io:
 
 ```toml
 [dependencies]
-memdiver = "0.1.0"
+memdiver = "0.1.1"
 ```
 
 The workspace publishes `memdiver` (the façade), `memdiver-core` (safe API), and
@@ -194,6 +206,7 @@ fn main() -> Result<(), memdiver::Error> {
 | `Process::pid()` / `name()` / `exe_path()` | Identity of the pinned process. |
 | `Process::is_alive()` | Liveness, zombie-aware on Linux. |
 | `Process::read` / `write` | Byte-slice transfers. |
+| `Process::write_code` | Reversible code write with temporary/page-by-page protection restore. |
 | `Process::read_bytes` | Allocate and read a byte range. |
 | `Process::read_value` / `write_value` | Typed `Pod` transfers. |
 | `Process::regions` / `region_at` | Committed regions and address lookup. |
@@ -242,6 +255,11 @@ transferred before the failure. On Windows the OS can copy a partial buffer and
 then fail the call; `memdiver` reports a write/read error in that case and does
 not claim success.
 
+Scoped code writes add `Error::CodeWrite` and `Error::CodeWriteRestore` for the
+case where restoration of the original page protection also fails. Both variants
+keep the write/protection failure (when there was one) and the restore failure
+with process, address, and range context.
+
 ## Platform details
 
 ### Linux
@@ -271,7 +289,10 @@ not claim success.
 * `/proc/<pid>/mem` offsets are signed 64-bit values. Addresses or ranges above
   `i64::MAX` are rejected as invalid rather than wrapped.
 * Linux has no API for changing another process's page protections;
-  `Process::protect` returns `Error::Unsupported`.
+  `Process::protect` returns `Error::Unsupported`. `Process::write_code` still
+  works: it writes through `/proc/<pid>/mem` and skips the protection step. It
+  does not synchronize the target's instruction cache; the coherence guarantee
+  is limited to x86/x86_64.
 
 ### Requirements and troubleshooting (Linux)
 
@@ -313,10 +334,21 @@ cat /proc/sys/kernel/yama/ptrace_scope
 * Pointer width uses `IsWow64Process`.
 * Pattern scans skip unreadable and guard regions and skip failed chunk reads.
 * `Process::protect` uses `VirtualProtectEx` and returns the previous protection
-  of the first page in the range. Windows cannot represent write-only pages, or
-  pages that are writable and executable without being readable; those requests
-  return `Error::InvalidProtection`. Execute-only (`PAGE_EXECUTE`) and guard
-  pages are representable.
+  of the first page in the range. A multi-page range can contain pages with
+  different protections, so that single value is not sufficient to restore the
+  whole range. Use `Process::write_code` for reversible code patching; it
+  captures and restores the exact previous protection of every page. Windows
+  cannot represent write-only pages, or pages that are writable and executable
+  without being readable; those requests return `Error::InvalidProtection`.
+  Execute-only (`PAGE_EXECUTE`) and guard pages are representable.
+* `Process::write_code` checks that the whole range is committed, changes each
+  page covering the range to `PAGE_EXECUTE_READWRITE`, writes the bytes, and
+  restores the page's exact original protection. If the write or a protection
+  change fails, it restores everything already changed and returns the original
+  failure; if restoration also fails, the error retains both failures. It does
+  not call `FlushInstructionCache`; instruction/data cache coherence is only
+  guaranteed on x86/x86_64, so callers on ARM64 must not assume patched code is
+  visible.
 * Guard pages are reported through `Protection::GUARD`.
 * `wait_for_exit` uses `WaitForSingleObject` on the pinned handle.
 * PE exports are parsed from the module file and converted with
@@ -353,6 +385,11 @@ required.
 * Linux cannot change page protections.
 * Symbol resolution is limited to named module exports.
 * Reads and writes are not atomic with respect to the target's own accesses.
+* `Process::write_code` does not flush the target's instruction cache. The
+  visibility guarantee is limited to x86/x86_64, where instruction and data
+  caches are coherent. On other architectures, including ARM64, the target may
+  execute stale instructions after a patch, and no cache-flush API is provided
+  yet.
 * The library never attaches a debugger, suspends threads, or injects code.
 * Pattern and value scans are best-effort snapshots of live memory: unreadable
   regions and failed chunk reads are skipped, and there is no
@@ -392,9 +429,9 @@ writes its heap buffer through the public API, and verifies the results from the
 child's point of view. It also exercises process discovery and by-name opening,
 read-only handles, regions, modules, pattern and typed-value scanning (including
 a signature embedded in the fixture's executable), pointer chains, bounded
-strings, batched transfers, waiting for exit, module exports against libc/ntdll,
-protection changes (Windows), the opt-in privilege helper, liveness, PID-reuse
-safety, errors, and concurrent access.
+strings, batched transfers, scoped code writes, waiting for exit, module exports
+against libc/ntdll, protection changes (Windows), the opt-in privilege helper,
+liveness, PID-reuse safety, errors, and concurrent access.
 
 Windows behaviour is type-checked and linted on Linux via the
 `x86_64-pc-windows-gnu` target and fully executed on Windows in CI. See

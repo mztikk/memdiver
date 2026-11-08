@@ -81,13 +81,13 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
    drop, exactly once. No leaked handles on any error path.
 8. **Liveness semantics are defined.** On Linux a zombie or a reused PID is not
    alive. On Windows liveness is the signaled state of the pinned handle.
-9. **Zero-length and overflow contracts are explicit.** Zero-length reads and
-   writes are no-ops that do not touch the target. Non-empty ranges that
-   overflow `u64` are rejected before any OS call. `protect` rejects empty
-   ranges.
+9. **Zero-length and overflow contracts are explicit.** Zero-length reads,
+   writes, and scoped code writes are no-ops that do not touch the target.
+   Non-empty ranges that overflow `u64` are rejected before any OS call.
+   `protect` rejects empty ranges.
 10. **Read-only handles never write.** `ProcessAccess::ReadOnly` must reject
-    `write`, `write_value` (for non-empty values) and `protect` with
-    `Error::ReadOnly` before any OS call. Zero-length writes remain no-ops.
+    `write`, `write_code`, `write_value` (for non-empty values) and `protect`
+    with `Error::ReadOnly` before any OS call. Zero-length writes remain no-ops.
 11. **Name-based opening is unambiguous.** `open_by_name` must never silently
     pick one of several matches; return the candidate list. Verify the opened
     image name after opening and retry a bounded number of times when the
@@ -116,6 +116,20 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
     result to the live module range.
 17. **No logging or printing from library code.** Callers decide how to report
     failures. Examples and the fixture may print.
+18. **Scoped code writes restore protection.** `write_code` is the supported
+    reversible code-patch helper. Linux writes through `/proc/<pid>/mem` and
+    skips protection. Windows must protect every page covering the range with
+    `PAGE_EXECUTE_READWRITE`, record the exact previous raw protection per page,
+    write, and restore every page on every exit path. It must not rely on
+    `protect`'s first-page return for a multi-page range. If writing or a later
+    protection change fails, restore everything already changed and return the
+    original failure; if a restore also fails, return a composite error that
+    keeps both failures. A write that succeeds but cannot restore protection is
+    also an error; never return `Ok(())` with a page still modified. The helper
+    does not flush the target's instruction cache. Instruction/data cache
+    coherence is guaranteed only on x86/x86_64; on other architectures,
+    including ARM64, callers must not assume patched code is visible. A
+    cache-flush operation is not provided yet.
 
 ## Unsafe code policy
 
@@ -174,7 +188,10 @@ in `memdiver-sys`.
   `ET_EXEC` addresses are absolute. Skip symbols outside the live module range.
 * Debug privileges are a Windows concept; return `Unsupported` on Linux.
 * Linux cannot change another process's page protection. `protect` must return
-  `Unsupported`.
+  `Unsupported`. `write_code` is still supported: it writes through
+  `/proc/<pid>/mem` and performs no protection step. It does not synchronize the
+  target's instruction cache; the coherence guarantee is limited to x86/x86_64
+  (no `FlushInstructionCache` equivalent is called).
 
 ### Windows
 
@@ -212,7 +229,21 @@ in `memdiver-sys`.
 * `VirtualProtectEx` cannot express write-only pages, or executable pages that
   are writable without being readable. Return `InvalidProtection` for those
   combinations instead of widening access. Execute-only maps to `PAGE_EXECUTE`.
-  The returned old protection describes the first page of a multi-page range.
+  The returned old protection describes **only the first page** of a multi-page
+  range; pages in one range may have different protections. Callers that need to
+  restore a range must track protection per page instead of trusting this value.
+* `write_code` protects each page covering the request individually with
+  `PAGE_EXECUTE_READWRITE`, records the exact raw `PAGE_PROTECTION_FLAGS` that
+  `VirtualProtectEx` returns for that page, and restores each page with the same
+  raw value. This preserves flags that the semantic `Protection` type cannot
+  round-trip (for example `PAGE_WRITECOPY` and `PAGE_GUARD`). It must restore
+  every changed page even when one restore fails, and report both the original
+  failure and the restore failure. Preflight the committed range and fail before
+  changing protection when a safe restore cannot be planned. The write does not
+  call `FlushInstructionCache`; visibility of patched instructions is guaranteed
+  only on x86/x86_64, where instruction and data caches are coherent. ARM64 and
+  other architectures need an explicit flush that the library does not provide
+  yet.
 * Guard pages (`PAGE_GUARD`) are reported in `Protection::GUARD`.
 * `PROCESS_VM_READ`/`WRITE` permission is checked by the OS. Protected processes
   and anti-cheat can deny access even to elevated callers.
@@ -232,10 +263,26 @@ Tests live at the lowest level that can observe the behaviour:
   batch-index error wrapping, export address rebasing, error formatting) gets
   unit tests next to the code, including boundary and malformed-input cases.
 * **Platform behaviour** (process discovery, name-based open, read-only access,
-  read, write, typed I/O, value/batch operations, regions, modules, scanning,
-  pointers, strings, wait-for-exit, privilege helper, exports, protection,
-  liveness) gets end-to-end tests in `crates/memdiver-integration-tests`
-  against the fixture child.
+  read, write, scoped code writes, typed I/O, value/batch operations, regions,
+  modules, scanning, pointers, strings, wait-for-exit, privilege helper, exports,
+  protection, liveness) gets end-to-end tests in
+  `crates/memdiver-integration-tests` against the fixture child.
+* Windows `write_code` tests must patch a known executable, non-writable code
+  address with its existing bytes so a failed restore cannot change fixture
+  behaviour, and must verify the page protection is identical afterwards. Do not
+  patch different instruction bytes into the running fixture.
+* Windows must also cover a multi-page range whose pages start with **different**
+  protections. The fixture's Windows-only `MULTI` target allocates two adjacent
+  pages (executable/read-only and read-only), exposes the base and page size, and
+  is kept alive for the test. The parent writes the existing bytes back and
+  checks both regions' original protections afterwards. The target is never
+  executed.
+* The instruction-cache coherence claim is x86/x86_64-only. Add a cfg-gated test
+  that pins the documented architecture condition, and never make non-x86
+  architectures fail for the absence of a guarantee.
+* Restoration-failure paths that cannot be forced deterministically through the
+  OS need a unit test for the composite error construction and formatting, with
+  a comment explaining why no end-to-end test forces the failure.
 * Tests must use the public API from `memdiver`, not `memdiver-sys` internals.
 * Tests must be deterministic and must not depend on enumeration order. Assert
   membership and sortedness, not exact whole-list contents.
