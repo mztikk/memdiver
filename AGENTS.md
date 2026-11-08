@@ -103,9 +103,10 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
     execute sequentially and an error names the zero-based entry index, the
     range, and the full underlying `Error` as its source. A read-only handle
     must reject a non-empty write batch before any entry is written.
-14. **Wait semantics are defined.** Linux polls liveness with start-time
-    verification; Windows waits on the pinned handle. `None` means indefinite,
-    and a timeout returns `false` without treating the process as exited.
+14. **Wait semantics are defined.** Linux waits on a pinned pidfd when
+    available, falling back to liveness polling with start-time verification;
+    Windows waits on the pinned handle. `None` means indefinite, and a timeout
+    returns `false` without treating the process as exited.
 15. **Privilege changes are opt-in.** Never enable `SeDebugPrivilege`
     automatically. It is a separate function; on Linux it returns `Unsupported`.
 16. **Exports reflect a module file, not patched memory.** Parse PE/ELF with
@@ -162,9 +163,11 @@ in `memdiver-sys`.
   processes that vanish mid-scan, and sort by PID. Matching is case-sensitive.
 * Pointer width comes from the ELF class byte of `/proc/<pid>/exe`. Reject
   non-ELF or unknown classes as malformed data.
-* `wait_for_exit` polls `/proc/<pid>/stat` (10 ms) and uses the captured start
-  time so a reused PID is not reported as exit. There is no exit code for
-  non-child processes.
+* `wait_for_exit` opens and verifies a pidfd at handle open, then blocks in
+  `poll`; this avoids periodic wakeups on Linux 5.3+. If `pidfd_open` is
+  unavailable or denied, it polls `/proc/<pid>/stat` (10 ms) and uses the
+  captured start time so a reused PID is not reported as exit. There is no exit
+  code for non-child processes.
 * ELF exports are parsed by `goblin` from the module file. Include defined
   global/weak dynamic symbols with default/protected visibility and function,
   object, or GNU IFUNC type. `ET_DYN` addresses are `module base + st_value`;

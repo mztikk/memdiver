@@ -260,8 +260,10 @@ not claim success.
 * ELF exports are read from the module file, filtered to defined global/weak
   default/protected dynamic symbols, and rebased using the ELF type
   (`ET_DYN`: module base + symbol value; `ET_EXEC`: absolute symbol value).
-* `wait_for_exit` polls `/proc/<pid>/stat` at 10 ms intervals and verifies the
-  start time, so PID reuse does not look like exit.
+* `wait_for_exit` blocks in `poll` on a pidfd, so an idle wait causes no
+  periodic wakeups. Kernels before 5.3, or hosts whose seccomp policy denies
+  `pidfd_open`, fall back to polling `/proc/<pid>/stat` at 10 ms intervals with
+  start-time verification.
 * The process start time from `/proc/<pid>/stat` is captured at open time and
   compared on later queries, so a reused PID is not mistaken for the original
   process. Zombies are reported as not alive.
@@ -360,7 +362,8 @@ required.
   discovery currently relies on section headers being present.
 * Batched transfers are sequential under the hood; they do not currently use
   scatter/gather syscalls.
-* Linux wait-for-exit polls procfs at 10 ms intervals. No portable exit code is
+* Linux wait-for-exit uses a pidfd where available and falls back to 10 ms
+  procfs polling on older or restricted kernels. No portable exit code is
   exposed for non-child processes.
 * `enable_debug_privilege` is Windows-only, opt-in, and normally requires
   administrator rights; it does not bypass protected-process policies.

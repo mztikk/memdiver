@@ -1,10 +1,11 @@
 //! Linux backend built on `/proc/<pid>/mem` and `/proc/<pid>/maps`.
 //!
-//! A [`ProcessHandle`] pins three things for its lifetime:
+//! A [`ProcessHandle`] pins four things for its lifetime:
 //!
 //! * the `/proc/<pid>` directory file descriptor,
-//! * the `/proc/<pid>/mem` file descriptor, and
-//! * the process start time from `/proc/<pid>/stat`.
+//! * the `/proc/<pid>/mem` file descriptor,
+//! * the process start time from `/proc/<pid>/stat`, and
+//! * a `pidfd` when the kernel supports `pidfd_open`.
 //!
 //! The memory file descriptor refers to the memory map that existed when it was
 //! opened. The start time lets the handle detect PID reuse for the queries that
@@ -16,7 +17,7 @@ use std::ffi::{CStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -42,6 +43,7 @@ pub struct ProcessHandle {
     proc_dir: File,
     mem: File,
     start_time: u64,
+    pidfd: Option<File>,
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -49,6 +51,7 @@ impl fmt::Debug for ProcessHandle {
         f.debug_struct("ProcessHandle")
             .field("pid", &self.pid)
             .field("start_time", &self.start_time)
+            .field("pidfd", &self.pidfd.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -99,11 +102,13 @@ impl ProcessHandle {
             return Err(process_exited(pid));
         }
 
+        let pidfd = open_verified_pidfd(pid, &proc_dir, after.start_time);
         Ok(Self {
             pid,
             proc_dir,
             mem,
             start_time: after.start_time,
+            pidfd,
         })
     }
 
@@ -211,15 +216,27 @@ impl ProcessHandle {
     /// Waits for the process to exit.
     ///
     /// Returns `true` when the process has exited and `false` when the timeout
-    /// expires first. `None` waits indefinitely. Liveness is checked by polling
-    /// `/proc/<pid>/stat`, including start-time verification, so a reused PID is
-    /// not mistaken for the original process.
+    /// expires first. `None` waits indefinitely.
+    ///
+    /// On kernels with `pidfd_open` (Linux 5.3+) this blocks in `poll` on a
+    /// pinned pidfd and wakes only when the process exits or the timeout
+    /// expires. Older kernels, or hosts whose seccomp policy denies
+    /// `pidfd_open`, fall back to polling `/proc/<pid>/stat` every 10 ms with
+    /// start-time verification.
     ///
     /// # Errors
     ///
-    /// Linux has no additional failure mode here; procfs read failures are
-    /// treated as process exit by [`ProcessHandle::is_alive`].
+    /// Returns an error when `poll` fails on a usable pidfd. In the polling
+    /// fallback, procfs read failures are treated as process exit by
+    /// [`ProcessHandle::is_alive`].
     pub fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<bool, Error> {
+        match &self.pidfd {
+            Some(pidfd) => poll_pidfd(pidfd.as_raw_fd(), timeout),
+            None => self.wait_for_exit_polling(timeout),
+        }
+    }
+
+    fn wait_for_exit_polling(&self, timeout: Option<Duration>) -> Result<bool, Error> {
         const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
         let Some(timeout) = timeout else {
@@ -520,6 +537,82 @@ fn invalid_range(address: u64) -> Error {
         None,
         format!("address range starting at {address:#x} cannot be represented by /proc/<pid>/mem"),
     )
+}
+
+fn open_verified_pidfd(pid: u32, proc_dir: &File, start_time: u64) -> Option<File> {
+    let pidfd = open_pidfd(pid)?;
+    match read_stat(proc_dir, pid) {
+        Ok(stat) if stat.start_time == start_time && !is_dead_state(stat.state) => Some(pidfd),
+        _ => None,
+    }
+}
+
+fn open_pidfd(pid: u32) -> Option<File> {
+    // SAFETY: pidfd_open takes a PID and flags and returns a new file
+    // descriptor or -1. The descriptor is adopted by `File` only after the
+    // success check.
+    let raw =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
+    let fd = libc::c_int::try_from(raw).ok()?;
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: the kernel just returned this fresh descriptor and ownership is
+    // transferred to the `File`.
+    Some(unsafe { File::from_raw_fd(fd) })
+}
+
+fn poll_pidfd(fd: RawFd, timeout: Option<Duration>) -> Result<bool, Error> {
+    let started = Instant::now();
+    loop {
+        let expired = timeout.is_some_and(|limit| started.elapsed() >= limit);
+        let wait_ms = match timeout {
+            None => -1,
+            Some(_) if expired => 0,
+            Some(limit) => poll_timeout_millis(limit.saturating_sub(started.elapsed())),
+        };
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` points to one initialized pollfd and remains
+        // valid for the call. The fd is owned by the process handle.
+        let result = unsafe { libc::poll(&mut descriptor, 1, wait_ms) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io_error(error));
+        }
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io_error(io::Error::from_raw_os_error(libc::EBADF)));
+            }
+            if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                return Ok(true);
+            }
+            if descriptor.revents & libc::POLLERR != 0 {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    None,
+                    "pidfd poll reported POLLERR",
+                ));
+            }
+            continue;
+        }
+        if expired {
+            return Ok(false);
+        }
+    }
+}
+
+fn poll_timeout_millis(remaining: Duration) -> libc::c_int {
+    let millis = remaining
+        .as_millis()
+        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+    millis.min(libc::c_int::MAX as u128) as libc::c_int
 }
 
 fn io_error(error: io::Error) -> Error {
@@ -981,6 +1074,46 @@ mod tests {
         assert_eq!(
             procfs_offset(u64::MAX, 1).expect_err("must fail").kind(),
             ErrorKind::InvalidAddress
+        );
+    }
+
+    #[test]
+    fn poll_timeout_rounds_up_and_caps() {
+        assert_eq!(poll_timeout_millis(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_millis(Duration::from_millis(1)), 1);
+        assert_eq!(poll_timeout_millis(Duration::from_micros(1_500)), 2);
+        assert_eq!(poll_timeout_millis(Duration::from_millis(1_500)), 1_500);
+        assert_eq!(poll_timeout_millis(Duration::MAX), libc::c_int::MAX);
+    }
+
+    #[test]
+    fn poll_helper_wakes_and_times_out() {
+        use std::io::Write;
+
+        let mut fds = [0; 2];
+        // SAFETY: `fds` points to two writable integers.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the pipe returned two fresh descriptors, each owned by one File.
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        // SAFETY: as above.
+        let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+
+        assert!(!poll_pidfd(reader.as_raw_fd(), Some(Duration::ZERO)).expect("immediate poll"));
+        assert!(
+            !poll_pidfd(reader.as_raw_fd(), Some(Duration::from_millis(5))).expect("timeout poll")
+        );
+        writer.write_all(b"x").expect("write pipe");
+        assert!(poll_pidfd(reader.as_raw_fd(), Some(Duration::from_secs(1))).expect("wake poll"));
+    }
+
+    #[test]
+    fn polling_fallback_respects_timeout() {
+        let handle = ProcessHandle::open(std::process::id()).expect("open self");
+        assert!(
+            !handle
+                .wait_for_exit_polling(Some(Duration::ZERO))
+                .expect("fallback poll")
         );
     }
 

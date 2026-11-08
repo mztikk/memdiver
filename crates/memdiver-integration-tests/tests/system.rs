@@ -15,6 +15,13 @@ fn wait_reports_timeout_then_exit() {
     assert!(
         !fixture
             .process
+            .wait_for_exit(Some(Duration::ZERO))
+            .expect("immediate poll"),
+        "a live process must not report exit for a zero timeout"
+    );
+    assert!(
+        !fixture
+            .process
             .wait_for_exit(Some(Duration::from_millis(50)))
             .expect("timed wait"),
         "a live process must not report exit"
@@ -40,6 +47,13 @@ fn wait_reports_timeout_then_exit() {
             .wait_for_exit(None)
             .expect("indefinite wait on a dead process"),
         "an already-exited process must return immediately"
+    );
+    assert!(
+        fixture
+            .process
+            .wait_for_exit(Some(Duration::ZERO))
+            .expect("zero timeout after exit"),
+        "a second wait on the same handle must still observe exit"
     );
 }
 

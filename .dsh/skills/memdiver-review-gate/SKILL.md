@@ -71,8 +71,9 @@ touch code examples.
   zero-sized values.
 * **Batching:** failures identify the entry index and preserve the full inner
   error; read-only handles reject non-empty write batches before writing.
-* **Waiting/privileges:** wait timeouts do not report exit, and privilege
-  enabling is opt-in, never automatic.
+* **Waiting/privileges:** Linux waits on a verified pidfd and falls back to
+  polling only when pidfd is unavailable; timeouts do not report exit, and
+  privilege enabling is opt-in, never automatic.
 * **Exports:** parsed from the module file with `goblin`; forwarders/ordinals are
   skipped, addresses are rebased and bounded to the live module.
 * **Platform parity:** the README matrix and docs match the implementation;

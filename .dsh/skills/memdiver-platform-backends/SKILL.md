@@ -106,6 +106,9 @@ The pinned-instance invariants are not negotiable:
   to `comm`, skips vanished processes, and sorts by PID. Name matching is
   case-sensitive.
 * Pointer width comes from the ELF class byte of `/proc/<pid>/exe`.
+* `wait_for_exit` prefers a verified pidfd and blocks in `poll`; fall back to
+  10 ms procfs liveness polling only when `pidfd_open` is unavailable or denied.
+  Verify the pidfd against the captured start time before trusting it.
 * Linux cannot change another process's protection: return
   `ErrorKind::Unsupported`.
 

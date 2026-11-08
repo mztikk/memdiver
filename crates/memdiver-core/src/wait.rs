@@ -8,9 +8,13 @@ impl Process {
     /// Waits for the process to exit.
     ///
     /// Returns `true` if the process exited and `false` if the timeout expired
-    /// first. Pass `None` to wait indefinitely. On Linux this polls the pinned
-    /// procfs handle and verifies the process start time, so PID reuse is not
-    /// mistaken for the original process exiting.
+    /// first. Pass `None` to wait indefinitely.
+    ///
+    /// On Linux this waits on a pinned pidfd when available (Linux 5.3+), so a
+    /// long wait consumes no periodic wakeups. Older kernels or hosts where
+    /// `pidfd_open` is blocked fall back to polling the pinned procfs handle
+    /// with start-time verification. PID reuse is never mistaken for the
+    /// original process exiting.
     ///
     /// # Errors
     ///

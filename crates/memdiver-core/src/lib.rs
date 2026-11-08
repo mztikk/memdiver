@@ -20,7 +20,7 @@
 //! | Typed value scanning / batch I/O | yes | yes |
 //! | Pointer width / chains | ELF class / implicit | `IsWow64Process` / checked pointers |
 //! | Strings | C and UTF-16LE helpers | C and UTF-16LE helpers |
-//! | Wait for exit | procfs polling | `WaitForSingleObject` |
+//! | Wait for exit | pidfd `poll` (polling fallback) | `WaitForSingleObject` |
 //! | Enable debug privilege | not supported | `SeDebugPrivilege` helper |
 //! | Module exports | ELF module file | PE module file |
 //! | Change protection | not supported | `VirtualProtectEx` |
