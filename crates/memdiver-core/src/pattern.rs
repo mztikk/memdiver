@@ -77,6 +77,24 @@ impl Pattern {
         self.bytes.is_empty()
     }
 
+    pub(crate) fn from_exact_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(Error::InvalidPattern {
+                reason: "pattern must contain at least one byte".to_owned(),
+            });
+        }
+        if bytes.len() > MAX_PATTERN_LEN {
+            return Err(Error::InvalidPattern {
+                reason: format!("pattern is longer than {MAX_PATTERN_LEN} bytes"),
+            });
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            masks: vec![0xFF; bytes.len()],
+            anchor: Some((0, bytes[0])),
+        })
+    }
+
     pub(crate) fn anchor(&self) -> Option<(usize, u8)> {
         self.anchor
     }

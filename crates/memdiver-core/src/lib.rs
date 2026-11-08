@@ -17,8 +17,12 @@
 //! | Memory regions | parsed from `/proc/<pid>/maps` | `VirtualQueryEx` |
 //! | Modules | executable file mappings from `/proc/<pid>/maps` | `EnumProcessModulesEx` |
 //! | Pattern scanning | chunked readable-memory reads | chunked readable-memory reads |
+//! | Typed value scanning / batch I/O | yes | yes |
 //! | Pointer width / chains | ELF class / implicit | `IsWow64Process` / checked pointers |
 //! | Strings | C and UTF-16LE helpers | C and UTF-16LE helpers |
+//! | Wait for exit | procfs polling | `WaitForSingleObject` |
+//! | Enable debug privilege | not supported | `SeDebugPrivilege` helper |
+//! | Module exports | ELF module file | PE module file |
 //! | Change protection | not supported | `VirtualProtectEx` |
 //!
 //! Transfers are all-or-nothing from the API's point of view: an operating
@@ -53,20 +57,27 @@
 #![forbid(unsafe_code)]
 
 mod address;
+mod batch;
 mod error;
+mod exports;
 mod module;
 mod pattern;
 mod pointer;
+mod privilege;
 mod process;
 mod process_info;
 mod region;
 mod scan;
 mod strings;
+mod value;
+mod wait;
 
 pub use address::Address;
 pub use error::{Error, Result};
+pub use exports::Export;
 pub use module::Module;
 pub use pattern::{Pattern, ScanOptions};
+pub use privilege::enable_debug_privilege;
 pub use process::{Process, ProcessAccess};
 pub use process_info::ProcessInfo;
 pub use region::Region;

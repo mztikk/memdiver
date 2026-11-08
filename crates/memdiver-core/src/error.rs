@@ -221,6 +221,73 @@ pub enum Error {
         source: OsError,
     },
 
+    /// A module file could not be read for export resolution.
+    #[error("failed to read module {module:?} from {path:?}: {source}")]
+    ModuleFile {
+        /// Module whose file was read.
+        module: String,
+        /// Path that was read.
+        path: std::path::PathBuf,
+        /// Filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A module file could not be parsed for export resolution.
+    #[error("failed to parse exports for module {module:?}: {reason}")]
+    ModuleExports {
+        /// Module that was being parsed.
+        module: String,
+        /// Description of the parse or format failure.
+        reason: String,
+    },
+
+    /// Waiting for the process failed.
+    #[error("failed while waiting for process {pid}: {source}")]
+    Wait {
+        /// PID of the target process.
+        pid: u32,
+        /// Underlying operating-system error.
+        #[source]
+        source: OsError,
+    },
+
+    /// Enabling a process privilege failed.
+    #[error("failed to enable a process privilege: {source}")]
+    Privilege {
+        /// Underlying operating-system error.
+        #[source]
+        source: OsError,
+    },
+
+    /// A batched read failed at one entry.
+    #[error("failed to read batch entry {index} at {address} ({len} bytes): {source}")]
+    BatchRead {
+        /// Zero-based index in the batch.
+        index: usize,
+        /// Address of the failed entry.
+        address: Address,
+        /// Requested length of the failed entry.
+        len: usize,
+        /// Underlying read error.
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// A batched write failed at one entry.
+    #[error("failed to write batch entry {index} at {address} ({len} bytes): {source}")]
+    BatchWrite {
+        /// Zero-based index in the batch.
+        index: usize,
+        /// Address of the failed entry.
+        address: Address,
+        /// Requested length of the failed entry.
+        len: usize,
+        /// Underlying write error.
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A pointer chain overflowed the target's address width.
     #[error("pointer chain overflow at {address} while adding {offset:#x} in process {pid}")]
     PointerChainOverflow {

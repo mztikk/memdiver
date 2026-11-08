@@ -22,11 +22,17 @@ pointer_width() -> Result<PointerWidth>
 read(address: u64, &mut [u8]) -> Result<usize>
 write(address: u64, &[u8]) -> Result<usize>
 is_alive() -> bool
+wait_for_exit(timeout: Option<Duration>) -> Result<bool>
 regions() -> Result<Vec<RawRegion>>
 modules() -> Result<Vec<RawModule>>
 protect(address, len, Protection) -> Result<Protection>
 processes() -> Result<Vec<RawProcessInfo>>
+enable_debug_privilege() -> Result<()>
 ```
+
+Module export parsing is a core concern: it reads the module file reported by
+the OS and parses it with `goblin`. Do not move file-format parsing into
+`memdiver-sys`; the sys layer only supplies module paths and memory access.
 
 The safe layer owns name matching, ambiguity handling, scan scoping, pointer
 chains, and string framing; the sys layer returns raw facts only.
@@ -121,6 +127,12 @@ The pinned-instance invariants are not negotiable:
   the first page of a multi-page range.
 * `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` is the liveness check. Do not
   use `GetExitCodeProcess == STILL_ACTIVE`; the exit code is ambiguous.
+* `wait_for_exit` uses `WaitForSingleObject` with millisecond timeouts. `None`
+  means `INFINITE`; cap very large durations instead of overflowing `u32`.
+* `enable_debug_privilege` opens the current process token, looks up
+  `SeDebugPrivilege`, and calls `AdjustTokenPrivileges`. A true return can still
+  mean `ERROR_NOT_ALL_ASSIGNED`; check `GetLastError` and map it to
+  `PermissionDenied`. Never enable privileges automatically.
 * Process enumeration uses `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)`.
   Check the `INVALID_HANDLE_VALUE` sentinel, capture `GetLastError` immediately,
   and retry `ERROR_BAD_LENGTH`. Close the snapshot on every path. Query image

@@ -44,8 +44,10 @@ Dependency direction is strictly one-way.
   procfs parsing, memory APIs, module enumeration. It defines no polished
   end-user ergonomics and does no type reinterpretation for callers.
 * `crates/memdiver-core` owns the safe API: `Address`, `Process`, `ProcessInfo`,
-  `Error`, `Region`, `Module`, `Pattern`, `ScanOptions`, pointer/string
-  helpers, and typed I/O. It must not contain platform FFI.
+  `Error`, `Region`, `Module`, `Export`, `Pattern`, `ScanOptions`,
+  pointer/string helpers, value and batch operations, export parsing
+  (`goblin`), the wait wrapper, and typed I/O. It must not contain platform
+  FFI.
 * `crates/memdiver` re-exports the public API and holds user-facing
   documentation and examples.
 * `crates/memdiver-integration-tests` contains the fixture binary and tests that
@@ -94,8 +96,24 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
     guard, and failed-read chunks, protect against unbounded result vectors with
     `ScanOptions::max_results`, and overlap chunks so patterns spanning a chunk
     boundary are still found. `find_pattern` searches modules; `find_patterns`
-    searches all readable memory. Document the difference.
-13. **No logging or printing from library code.** Callers decide how to report
+    searches all readable memory; value scans use the same machinery with the
+    value's exact native bytes. Document the difference and reject zero-sized
+    values.
+13. **Batched operations identify the entry.** `read_many` / `write_many`
+    execute sequentially and an error names the zero-based entry index, the
+    range, and the full underlying `Error` as its source. A read-only handle
+    must reject a non-empty write batch before any entry is written.
+14. **Wait semantics are defined.** Linux polls liveness with start-time
+    verification; Windows waits on the pinned handle. `None` means indefinite,
+    and a timeout returns `false` without treating the process as exited.
+15. **Privilege changes are opt-in.** Never enable `SeDebugPrivilege`
+    automatically. It is a separate function; on Linux it returns `Unsupported`.
+16. **Exports reflect a module file, not patched memory.** Parse PE/ELF with
+    `goblin` from the module path reported by the OS; document deleted/replaced
+    files, PE forwarders, ordinal-only exports, and ELF section-header
+    requirements. Rebase with the live module base and ELF type; bound every
+    result to the live module range.
+17. **No logging or printing from library code.** Callers decide how to report
     failures. Examples and the fixture may print.
 
 ## Unsafe code policy
@@ -144,6 +162,14 @@ in `memdiver-sys`.
   processes that vanish mid-scan, and sort by PID. Matching is case-sensitive.
 * Pointer width comes from the ELF class byte of `/proc/<pid>/exe`. Reject
   non-ELF or unknown classes as malformed data.
+* `wait_for_exit` polls `/proc/<pid>/stat` (10 ms) and uses the captured start
+  time so a reused PID is not reported as exit. There is no exit code for
+  non-child processes.
+* ELF exports are parsed by `goblin` from the module file. Include defined
+  global/weak dynamic symbols with default/protected visibility and function,
+  object, or GNU IFUNC type. `ET_DYN` addresses are `module base + st_value`;
+  `ET_EXEC` addresses are absolute. Skip symbols outside the live module range.
+* Debug privileges are a Windows concept; return `Unsupported` on Linux.
 * Linux cannot change another process's page protection. `protect` must return
   `Unsupported`.
 
@@ -165,6 +191,14 @@ in `memdiver-sys`.
   not a failed enumeration. Match names ASCII case-insensitively.
 * Pointer width comes from `IsWow64Process`; a WOW64 target is 32-bit, otherwise
   fall back to host pointer width.
+* `wait_for_exit` uses `WaitForSingleObject` with millisecond timeouts; extremely
+  long durations are capped by the Win32 range.
+* `enable_debug_privilege` opens the current process token, looks up
+  `SeDebugPrivilege`, and adjusts it. Check `ERROR_NOT_ALL_ASSIGNED` after a
+  successful `AdjustTokenPrivileges` call; map it to `PermissionDenied`.
+* PE exports are parsed by `goblin` from the module file. Include named,
+  non-forwarded exports and rebase by `live module base + RVA`; validate the
+  result stays inside the live image.
 * Module enumeration can race with module load/unload. Retry a bounded number
   of times on `ERROR_PARTIAL_COPY` / `ERROR_INSUFFICIENT_BUFFER`; never loop
   forever.
@@ -191,12 +225,14 @@ Tests live at the lowest level that can observe the behaviour:
 
 * **Pure logic** (address arithmetic, protection translation, procfs parsing,
   stat parsing, module merging, region containment, pattern parsing/matching,
-  chunk scanning, pointer arithmetic, error formatting) gets unit tests next to
-  the code, including boundary and malformed-input cases.
+  chunk scanning, pointer arithmetic, string framing, value encoding,
+  batch-index error wrapping, export address rebasing, error formatting) gets
+  unit tests next to the code, including boundary and malformed-input cases.
 * **Platform behaviour** (process discovery, name-based open, read-only access,
-  read, write, typed I/O, regions, modules, scanning, pointers, strings,
-  protection, liveness) gets end-to-end tests in
-  `crates/memdiver-integration-tests` against the fixture child.
+  read, write, typed I/O, value/batch operations, regions, modules, scanning,
+  pointers, strings, wait-for-exit, privilege helper, exports, protection,
+  liveness) gets end-to-end tests in `crates/memdiver-integration-tests`
+  against the fixture child.
 * Tests must use the public API from `memdiver`, not `memdiver-sys` internals.
 * Tests must be deterministic and must not depend on enumeration order. Assert
   membership and sortedness, not exact whole-list contents.

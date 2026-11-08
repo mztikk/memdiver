@@ -16,11 +16,20 @@ categories = ["os", "api-bindings", "development-tools::debugging"]
 [workspace.dependencies]
 bytemuck = "1"
 bitflags = "2"
+goblin = { version = "0.10", default-features = false, features = [
+    "std",
+    "endian_fd",
+    "elf32",
+    "elf64",
+    "pe32",
+    "pe64",
+] }
 libc = "0.2"
 memchr = "2"
 thiserror = "2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",

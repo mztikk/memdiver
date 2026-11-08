@@ -20,6 +20,7 @@ crates/memdiver-integration-tests/
   tests/process_selection.rs    process list, by-name open, read-only access
   tests/scanning.rs             module/heap scans, wildcards, alignment, limits
   tests/navigation.rs           pointer width/chains, bounded C/UTF-16 strings
+  tests/system.rs               wait-for-exit, privilege helper, module exports
   tests/lifecycle.rs            liveness, open failures, dead-process I/O
 ```
 
@@ -87,6 +88,16 @@ scans rely on it being in an image section.
 * Pointer tests must honor `PointerWidth` (write `u32` or `u64` accordingly),
   check empty chains, and cover width-specific overflow. String tests cover
   truncation, lossy decoding, unpaired surrogates, and multi-chunk reads.
+* Value tests write a unique value into the heap, assert all-memory scan finds
+  it, assert module scans do not, and assert zero-sized values are rejected.
+* Batch tests cover ordered reads/writes, empty batches, entry-index errors with
+  the underlying error preserved, and read-only rejection for non-empty writes.
+* Wait tests use a second handle in a thread, kill the fixture after a short
+  delay, and assert timeout-then-exit behavior and immediate return after death.
+* Privilege tests are platform-gated: Linux asserts `Unsupported`; Windows
+  accepts success or a structured `Error::Privilege`.
+* Export tests resolve a real libc export on Linux and an ntdll export on
+  Windows, assert the address is inside the module, and verify name lookup.
 * Windows-only tests go behind `#[cfg(windows)]`. Linux-only tests, such as the
   `protect` `Unsupported` case, go behind `#[cfg(target_os = "linux")]`.
 * Use `Address::checked_add` for addresses. Test overflow and zero-length

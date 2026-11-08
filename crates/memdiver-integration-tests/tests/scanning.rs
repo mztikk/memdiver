@@ -175,3 +175,47 @@ fn module_at_reports_module_bounds() {
         Some(module)
     );
 }
+
+#[test]
+fn finds_typed_values_in_memory_and_modules() {
+    let fixture = Fixture::spawn();
+    let value = 0xDEAD_BEEF_CAFE_F00D_u64;
+    let address = Address::new((fixture.address.get() + 0x600 + 7) & !7);
+    fixture
+        .process
+        .write_value(address, value)
+        .expect("write value");
+    assert!(address.get() + 8 <= fixture.address.get() + fixture.len as u64);
+
+    let options = ScanOptions::new().with_alignment(8);
+    let all = fixture
+        .process
+        .find_values(value, &options)
+        .expect("value scan");
+    assert!(all.contains(&address), "value hit missing: {all:?}");
+
+    let in_modules = fixture
+        .process
+        .find_values_in_modules(value, &options)
+        .expect("module value scan");
+    assert!(!in_modules.contains(&address));
+
+    let in_module = fixture
+        .process
+        .find_values_in_module(&fixture_name(), value, &options)
+        .expect("single module value scan");
+    assert!(!in_module.contains(&address));
+}
+
+#[test]
+fn zero_sized_value_scan_is_rejected() {
+    let fixture = Fixture::spawn();
+    let error = fixture
+        .process
+        .find_values([0u8; 0], &ScanOptions::default())
+        .expect_err("zero-sized value must fail");
+    assert!(
+        matches!(error, Error::InvalidPattern { .. }),
+        "unexpected {error:?}"
+    );
+}

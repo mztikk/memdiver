@@ -14,6 +14,7 @@ readme = "../../README.md"
 
 [dependencies]
 bytemuck.workspace = true
+goblin.workspace = true
 memchr.workspace = true
 thiserror.workspace = true
 memdiver-sys.workspace = true

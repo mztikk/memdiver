@@ -35,12 +35,12 @@ use bitflags::bitflags;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{ProcessHandle, processes};
+pub use linux::{ProcessHandle, enable_debug_privilege, processes};
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{ProcessHandle, processes};
+pub use windows::{ProcessHandle, enable_debug_privilege, processes};
 
 #[cfg(not(any(target_os = "linux", windows)))]
 compile_error!("memdiver supports only Linux and Windows targets");

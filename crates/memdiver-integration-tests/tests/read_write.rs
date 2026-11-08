@@ -230,3 +230,89 @@ fn works_concurrently_from_multiple_threads() {
         assert_eq!(fixture.peek(offset, 64), vec![index; 64]);
     }
 }
+
+#[test]
+fn batch_reads_and_writes_work_in_order() {
+    let mut fixture = Fixture::spawn();
+    let expected = pattern(fixture.len);
+    let first = fixture.address;
+    let second = fixture.address.checked_add(64).expect("address");
+
+    let results = fixture
+        .process
+        .read_many(&[(first, 8), (second, 16)])
+        .expect("batch read");
+    assert_eq!(
+        results,
+        vec![expected[..8].to_vec(), expected[64..80].to_vec()]
+    );
+
+    let payload_a = [0xAA; 8];
+    let payload_b = [0xBB; 16];
+    fixture
+        .process
+        .write_many(&[(first, &payload_a), (second, &payload_b)])
+        .expect("batch write");
+    assert_eq!(fixture.peek(0, 8), payload_a);
+    assert_eq!(fixture.peek(64, 16), payload_b);
+
+    assert!(
+        fixture
+            .process
+            .read_many(&[])
+            .expect("empty read batch")
+            .is_empty()
+    );
+    fixture.process.write_many(&[]).expect("empty write batch");
+}
+
+#[test]
+fn batch_errors_identify_the_failing_entry() {
+    let fixture = Fixture::spawn();
+    let bad = Address::new(u64::MAX);
+    let error = fixture
+        .process
+        .read_many(&[(fixture.address, 8), (bad, 8)])
+        .expect_err("batch read must fail");
+    match error {
+        Error::BatchRead {
+            index,
+            address,
+            source,
+            ..
+        } => {
+            assert_eq!(index, 1);
+            assert_eq!(address, bad);
+            assert!(matches!(*source, Error::AddressRange { .. }));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let error = fixture
+        .process
+        .write_many(&[(fixture.address, b"ok"), (bad, b"no")])
+        .expect_err("batch write must fail");
+    match error {
+        Error::BatchWrite { index, source, .. } => {
+            assert_eq!(index, 1);
+            assert!(matches!(*source, Error::AddressRange { .. }));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn read_only_batch_writes_are_rejected() {
+    let fixture = Fixture::spawn();
+    let readonly = Process::open_readonly(fixture.process.pid()).expect("read-only open");
+    let error = readonly
+        .write_many(&[(fixture.address, b"nope")])
+        .expect_err("read-only batch write must fail");
+    assert!(
+        matches!(error, Error::ReadOnly { .. }),
+        "unexpected {error:?}"
+    );
+    readonly
+        .write_many(&[(fixture.address, b"")])
+        .expect("zero-length batch write is a no-op");
+}

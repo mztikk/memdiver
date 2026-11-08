@@ -37,8 +37,13 @@
 //! | Query region protection | yes | yes |
 //! | Change region protection | no | yes |
 //! | Pattern scanning (modules or all readable memory) | yes | yes |
+//! | Typed value scanning | yes | yes |
+//! | Batch reads and writes | yes | yes |
 //! | Pointer width and pointer chains | yes | yes |
 //! | Bounded C / UTF-16 strings | yes | yes |
+//! | Wait for process exit | yes | yes |
+//! | Enable debug privilege | no | yes |
+//! | Module exports (PE / ELF) | yes | yes |
 //!
 //! # Operating-system permission model
 //!
@@ -68,6 +73,7 @@
 #![forbid(unsafe_code)]
 
 pub use memdiver_core::{
-    Address, Error, Module, OsError, OsErrorKind, Pattern, PointerWidth, Process, ProcessAccess,
-    ProcessInfo, Protection, Region, RegionKind, Result, ScanOptions,
+    Address, Error, Export, Module, OsError, OsErrorKind, Pattern, PointerWidth, Process,
+    ProcessAccess, ProcessInfo, Protection, Region, RegionKind, Result, ScanOptions,
+    enable_debug_privilege,
 };

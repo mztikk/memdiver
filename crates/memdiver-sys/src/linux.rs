@@ -19,6 +19,8 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::{
     Error, ErrorKind, PointerWidth, Protection, RawModule, RawProcessInfo, RawRegion, RegionKind,
@@ -206,6 +208,42 @@ impl ProcessHandle {
         }
     }
 
+    /// Waits for the process to exit.
+    ///
+    /// Returns `true` when the process has exited and `false` when the timeout
+    /// expires first. `None` waits indefinitely. Liveness is checked by polling
+    /// `/proc/<pid>/stat`, including start-time verification, so a reused PID is
+    /// not mistaken for the original process.
+    ///
+    /// # Errors
+    ///
+    /// Linux has no additional failure mode here; procfs read failures are
+    /// treated as process exit by [`ProcessHandle::is_alive`].
+    pub fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<bool, Error> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+        let Some(timeout) = timeout else {
+            while self.is_alive() {
+                thread::sleep(POLL_INTERVAL);
+            }
+            return Ok(true);
+        };
+        if !self.is_alive() {
+            return Ok(true);
+        }
+        let started = Instant::now();
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Ok(!self.is_alive());
+            }
+            thread::sleep((timeout - elapsed).min(POLL_INTERVAL));
+            if !self.is_alive() {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Enumerates the committed memory regions of the process.
     ///
     /// # Errors
@@ -373,6 +411,20 @@ fn read_link_at(dir: &File, name: &CStr) -> io::Result<PathBuf> {
                 )
             })?;
     }
+}
+
+/// Enables debug privileges.
+///
+/// Debug privileges are a Windows concept. On Linux the equivalent control is
+/// the ptrace access check (`kernel.yama.ptrace_scope`, capabilities, or the
+/// target opting in with `PR_SET_PTRACER`), so this always returns
+/// [`ErrorKind::Unsupported`].
+pub fn enable_debug_privilege() -> Result<(), Error> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        None,
+        "debug privileges are a Windows concept; use ptrace permissions on Linux",
+    ))
 }
 
 fn process_exited(pid: u32) -> Error {

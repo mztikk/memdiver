@@ -11,12 +11,17 @@ use std::fmt;
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_ADDRESS, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
-    ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, GetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
-    WAIT_TIMEOUT,
+    ERROR_NOT_ALL_ASSIGNED, ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, GetLastError, HANDLE, HMODULE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -32,10 +37,10 @@ use windows_sys::Win32::System::ProcessStatus::{
     EnumProcessModulesEx, GetModuleFileNameExW, GetModuleInformation, LIST_MODULES_ALL, MODULEINFO,
 };
 use windows_sys::Win32::System::Threading::{
-    IsWow64Process, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, QueryFullProcessImageNameW,
-    WaitForSingleObject,
+    GetCurrentProcess, IsWow64Process, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    QueryFullProcessImageNameW, WaitForSingleObject,
 };
 
 use crate::{
@@ -239,6 +244,33 @@ impl ProcessHandle {
         // SAFETY: the handle is owned by `self` and valid for the call.
         let result = unsafe { WaitForSingleObject(self.handle.as_handle(), 0) };
         result == WAIT_TIMEOUT
+    }
+
+    /// Waits for the process to exit.
+    ///
+    /// Returns `true` when the process exited and `false` when the timeout
+    /// expired first. `None` waits indefinitely. Timeouts longer than roughly
+    /// 49 days are capped by the Win32 millisecond timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `WaitForSingleObject` fails.
+    pub fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<bool, Error> {
+        let millis = timeout.map_or(u32::MAX, |timeout| {
+            let millis = timeout.as_millis();
+            if millis == 0 {
+                0
+            } else {
+                u32::try_from(millis).unwrap_or(u32::MAX - 1)
+            }
+        });
+        // SAFETY: the handle is owned by `self` and valid for the call.
+        let result = unsafe { WaitForSingleObject(self.handle.as_handle(), millis) };
+        match result {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(last_error()),
+        }
     }
 
     /// Enumerates the committed memory regions of the process.
@@ -650,6 +682,73 @@ fn query_image_path(handle: HANDLE) -> Option<PathBuf> {
     }
     buffer.truncate(length as usize);
     Some(PathBuf::from(wide_to_string(&buffer)))
+}
+
+/// Enables the current process's `SeDebugPrivilege`.
+///
+/// This only succeeds when the caller is an administrator and the privilege is
+/// available to the token. It does not by itself guarantee access to a
+/// protected process. The function changes the current process token and is
+/// intentionally opt-in.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::PermissionDenied`] when the privilege is not assigned,
+/// and other Win32 errors for token failures.
+pub fn enable_debug_privilege() -> Result<(), Error> {
+    let mut token: HANDLE = ptr::null_mut();
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle and `token` is
+    // writable; ownership of the returned token handle is transferred to
+    // `OwnedHandle` on success.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    };
+    if opened == 0 {
+        return Err(last_error());
+    }
+    let token = OwnedHandle::new(token);
+
+    // SAFETY: LUID is plain-old-data and zero is a valid initial value.
+    let mut luid = unsafe { zeroed() };
+    // SAFETY: SE_DEBUG_NAME is a valid static UTF-16 string and `luid` is
+    // writable. A null system name means the local system.
+    let found = unsafe { LookupPrivilegeValueW(ptr::null(), SE_DEBUG_NAME, &mut luid) };
+    if found == 0 {
+        return Err(last_error());
+    }
+
+    // SAFETY: TOKEN_PRIVILEGES is plain-old-data and zero is valid.
+    let mut privileges: TOKEN_PRIVILEGES = unsafe { zeroed() };
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    // SAFETY: the token handle is valid, `privileges` describes one entry, and
+    // null previous-state pointers are allowed with a zero buffer length.
+    let changed = unsafe {
+        AdjustTokenPrivileges(
+            token.as_handle(),
+            0,
+            &privileges,
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if changed == 0 {
+        return Err(last_error());
+    }
+    // AdjustTokenPrivileges can report success even when the privilege was not
+    // assigned to the token.
+    let code = last_error_code();
+    if code == ERROR_NOT_ALL_ASSIGNED {
+        return Err(win_error_with_kind(code, ErrorKind::PermissionDenied));
+    }
+    Ok(())
 }
 
 fn is_retryable_process_error(error: &Error) -> bool {

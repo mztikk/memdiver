@@ -31,8 +31,13 @@ or real cross-process integration tests.
 | Change region protection | no | yes |
 | Wildcard pattern scan in one module or all modules | yes | yes |
 | Wildcard pattern scan in all readable memory | yes | yes |
+| Typed value scanning | yes | yes |
+| Batch reads and writes | yes | yes |
 | Pointer width detection and pointer chains | yes | yes |
 | Bounded C strings and UTF-16LE strings | yes | yes |
+| Wait for process exit | yes | yes |
+| Enable SeDebugPrivilege (opt-in) | no | yes |
+| Module exports (PE / ELF) | yes | yes |
 | Detect target exit | yes | yes |
 | PID reuse cannot redirect access | yes | yes |
 
@@ -51,6 +56,12 @@ or real cross-process integration tests.
 * **Navigation primitives.** Pointer-width detection, pointer-chain resolution,
   bounded C/UTF-16 string reads, and module-at-address lookup turn raw addresses
   into usable values.
+* **Value and batch operations.** Typed values can be scanned directly, and
+  independent ranges can be read or written in one call with the failing entry
+  identified in the error.
+* **Exports and process control.** Named PE/ELF module exports are resolved to
+  live addresses; processes can be awaited and, on Windows, the caller can
+  opt in to enabling `SeDebugPrivilege`.
 * **Read-only handles.** Open with `ProcessAccess::ReadOnly` when writes are not
   needed; write and protection operations are rejected before any OS call.
 * **No silent truncation.** A read or write that transfers fewer bytes than
@@ -191,9 +202,15 @@ fn main() -> Result<(), memdiver::Error> {
 | `Process::find_pattern_in_module` / `find_patterns_in_module` / `find_patterns_in_modules` | Module-scoped scans. |
 | `Process::pointer_width` / `read_pointer` / `resolve_pointer_chain` | Pointer-width detection and chain traversal. |
 | `Process::read_c_string` / `read_c_string_lossy` / `read_utf16_string` | Bounded string reads. |
+| `Process::find_values` / `find_values_in_modules` / `find_values_in_module` | Search for typed values. |
+| `Process::read_many` / `write_many` | Batched transfers with indexed errors. |
+| `Process::wait_for_exit` | Block with an optional timeout until the process exits. |
+| `Process::module_exports` / `module_export` | Named PE/ELF exports resolved to live addresses. |
+| `enable_debug_privilege()` | Opt-in Windows `SeDebugPrivilege` helper (Linux: unsupported). |
 | `Process::protect` | Change page protection (Windows only). |
 | `Address` | `u64` target address with checked arithmetic and hex formatting. |
 | `Pattern`, `ScanOptions` | Wildcard patterns and scan filtering. |
+| `Export` | A named module export and its live address. |
 | `PointerWidth`, `ProcessAccess`, `ProcessInfo` | Public supporting types. |
 | `Protection` | Read / write / execute / guard flags. |
 | `Region`, `Module` | Snapshots with base, size, bounds checks, and metadata. |
@@ -237,9 +254,14 @@ not claim success.
 * Process enumeration reads `/proc`, preferring the executable file name and
   falling back to `/proc/<pid>/comm`. Names match case-sensitively.
 * Pointer width comes from the ELF class of `/proc/<pid>/exe`.
-* Pattern scans read readable, non-guard regions in chunks with overlap.
-  Unreadable regions and failed chunk reads are skipped; scans are best-effort
-  over live memory.
+* Pattern and value scans read readable, non-guard regions in chunks with
+  overlap. Unreadable regions and failed chunk reads are skipped; scans are
+  best-effort over live memory.
+* ELF exports are read from the module file, filtered to defined global/weak
+  default/protected dynamic symbols, and rebased using the ELF type
+  (`ET_DYN`: module base + symbol value; `ET_EXEC`: absolute symbol value).
+* `wait_for_exit` polls `/proc/<pid>/stat` at 10 ms intervals and verifies the
+  start time, so PID reuse does not look like exit.
 * The process start time from `/proc/<pid>/stat` is captured at open time and
   compared on later queries, so a reused PID is not mistaken for the original
   process. Zombies are reported as not alive.
@@ -293,6 +315,12 @@ cat /proc/sys/kernel/yama/ptrace_scope
   return `Error::InvalidProtection`. Execute-only (`PAGE_EXECUTE`) and guard
   pages are representable.
 * Guard pages are reported through `Protection::GUARD`.
+* `wait_for_exit` uses `WaitForSingleObject` on the pinned handle.
+* PE exports are parsed from the module file and converted with
+  `live_module_base + RVA`; forwarded exports and unnamed ordinals are skipped.
+* `enable_debug_privilege` opens the current process token and enables
+  `SeDebugPrivilege`. It is opt-in, never automatic, and normally requires
+  administrator rights.
 * Protected processes, anti-cheat drivers, and kernel-only processes can deny
   even an elevated handle. That is reported as an OS error, not hidden.
 
@@ -304,6 +332,8 @@ access boundary. Writing to a live process can corrupt its state or crash it.
 Reading memory can expose secrets. Use the library only with processes and data
 you are authorized to access. Prefer `Process::open_readonly` (or
 `ProcessAccess::ReadOnly` via `Process::open_with`) when writes are not needed.
+`enable_debug_privilege` is opt-in and broadens the current process's access; call
+it only when the task actually needs it.
 
 Typed reads are memory-safe in Rust because only `Pod` types are accepted, but
 the bytes read can still be semantically invalid for the target program. The
@@ -316,13 +346,24 @@ required.
 
 * Linux and Windows only. Other targets fail to compile with an explicit error.
 * Processes are opened by PID or by a unique image name; matching by path or
-  command line and symbol resolution are out of scope.
+  command line is out of scope.
 * Linux cannot change page protections.
-* There is no batching/vectored I/O API yet.
+* Symbol resolution is limited to named module exports.
 * Reads and writes are not atomic with respect to the target's own accesses.
 * The library never attaches a debugger, suspends threads, or injects code.
-* Pattern scans are best-effort snapshots of live memory: unreadable regions and
-  failed chunk reads are skipped, and there is no cancellation/progress API yet.
+* Pattern and value scans are best-effort snapshots of live memory: unreadable
+  regions and failed chunk reads are skipped, and there is no
+  cancellation/progress API yet.
+* Module exports are parsed from the module file reported by the OS, not from
+  the live mapped image. A deleted or replaced file, or PE forwarders and
+  unnamed ordinal exports, can make the result incomplete or unavailable. ELF
+  discovery currently relies on section headers being present.
+* Batched transfers are sequential under the hood; they do not currently use
+  scatter/gather syscalls.
+* Linux wait-for-exit polls procfs at 10 ms intervals. No portable exit code is
+  exposed for non-child processes.
+* `enable_debug_privilege` is Windows-only, opt-in, and normally requires
+  administrator rights; it does not bypass protected-process policies.
 * Process-name matching uses the platform's process image name. Linux
   `comm` names are only used when the executable name is unavailable.
 * Wildcard patterns support whole bytes and nibble masks; there is no regular
@@ -345,14 +386,16 @@ just example         # run the inspection example
 The end-to-end suite starts a real child process (`memdiver-fixture`), reads and
 writes its heap buffer through the public API, and verifies the results from the
 child's point of view. It also exercises process discovery and by-name opening,
-read-only handles, regions, modules, pattern scanning (including a signature
-embedded in the fixture's executable), pointer chains, bounded strings,
-protection changes (Windows), liveness, PID-reuse safety, errors, and concurrent
-access.
+read-only handles, regions, modules, pattern and typed-value scanning (including
+a signature embedded in the fixture's executable), pointer chains, bounded
+strings, batched transfers, waiting for exit, module exports against libc/ntdll,
+protection changes (Windows), the opt-in privilege helper, liveness, PID-reuse
+safety, errors, and concurrent access.
 
 Windows behaviour is type-checked and linted on Linux via the
-`x86_64-pc-windows-gnu` target and fully executed on Windows in CI. See [AGENTS.md](AGENTS.md) and the
-skills under [`.dsh/skills`](.dsh/skills) for the development rules.
+`x86_64-pc-windows-gnu` target and fully executed on Windows in CI. See
+[AGENTS.md](AGENTS.md) and the skills under [`.dsh/skills`](.dsh/skills) for the
+development rules.
 
 ### Workspace layout
 
