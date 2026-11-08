@@ -1,5 +1,7 @@
 # memdiver
 
+[![crates.io](https://img.shields.io/crates/v/memdiver.svg)](https://crates.io/crates/memdiver)
+[![docs.rs](https://docs.rs/memdiver/badge.svg)](https://docs.rs/memdiver)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](#toolchain)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -83,16 +85,16 @@ or real cross-process integration tests.
 
 ## Installation
 
-The crate has not been published to crates.io yet. Until the first release, use
-the repository directly:
+The crates are published on crates.io:
 
 ```toml
 [dependencies]
-memdiver = { git = "https://github.com/mztikk/memdiver" }
+memdiver = "0.1.0"
 ```
 
-The intended crates.io names are `memdiver`, `memdiver-core`, and
-`memdiver-sys`. Use a `path` dependency when working inside the workspace.
+The workspace publishes `memdiver` (the façade), `memdiver-core` (safe API), and
+`memdiver-sys` (operating-system bindings). Use a `path` dependency when working
+inside the workspace.
 
 The crate is a façade over `memdiver-core`, which in turn uses the low-level
 `memdiver-sys` bindings. Most users only need `memdiver`.
