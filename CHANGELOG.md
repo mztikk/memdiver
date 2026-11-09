@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 This project follows [SemVer](https://semver.org/). Before 1.0, the minor
 version is bumped for backwards-incompatible changes.
 
+## [Unreleased]
+
+### Fixed
+
+- Windows: a failed `ReadProcessMemory`/`WriteProcessMemory` against an exited
+  target is now classified as `ProcessExited` instead of a generic OS error, so
+  a scan that races process exit aborts instead of returning a partial or empty
+  result. `ERROR_PARTIAL_COPY` is classified as `InvalidAddress` while the
+  target is still alive.
+
 ## [0.2.0] - 2026-11-08
 
 This release contains breaking changes to the public error types and to several

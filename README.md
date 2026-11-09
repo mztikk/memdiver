@@ -348,6 +348,8 @@ cat /proc/sys/kernel/yama/ptrace_scope
   ASCII case-insensitively.
 * Pointer width uses `IsWow64Process2`, falling back to `IsWow64Process` on older systems.
 * Pattern scans skip unreadable and guard regions and skip failed chunk reads.
+  A transfer that fails after the target exits is classified as a process exit,
+  so a scan racing the exit aborts instead of returning a partial result.
 * `Process::protect` uses `VirtualProtectEx` and returns the previous protection
   of the first page in the range. A multi-page range can contain pages with
   different protections, so that single value is not sufficient to restore the

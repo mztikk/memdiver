@@ -225,7 +225,13 @@ impl ProcessHandle {
             )
         };
         if succeeded == 0 {
-            return Err(last_error());
+            let code = last_error_code();
+            // A failed transfer against an exited process usually reports
+            // ERROR_PARTIAL_COPY rather than ERROR_INVALID_HANDLE. Check the
+            // pinned handle before classifying so a scan racing process exit
+            // sees ProcessExited and aborts instead of skipping the chunk.
+            self.ensure_alive()?;
+            return Err(win_error(code));
         }
         Ok(transferred)
     }
@@ -258,7 +264,12 @@ impl ProcessHandle {
             )
         };
         if succeeded == 0 {
-            return Err(last_error());
+            let code = last_error_code();
+            // See `read`: a short failed write after process exit reports
+            // ERROR_PARTIAL_COPY, which must not be mistaken for an ordinary
+            // unmapped range.
+            self.ensure_alive()?;
+            return Err(win_error(code));
         }
         Ok(transferred)
     }
@@ -1287,7 +1298,7 @@ fn win_error(code: u32) -> Error {
     let kind = match code {
         ERROR_ACCESS_DENIED => ErrorKind::PermissionDenied,
         ERROR_INVALID_HANDLE => ErrorKind::ProcessExited,
-        ERROR_INVALID_ADDRESS => ErrorKind::InvalidAddress,
+        ERROR_INVALID_ADDRESS | ERROR_PARTIAL_COPY => ErrorKind::InvalidAddress,
         ERROR_NOT_FOUND => ErrorKind::NotFound,
         _ => ErrorKind::Other,
     };
@@ -1365,6 +1376,13 @@ mod tests {
             u32::MAX - 1
         );
         assert_eq!(timeout_millis(Some(Duration::MAX)), u32::MAX - 1);
+    }
+
+    #[test]
+    fn classifies_partial_copy_as_invalid_address() {
+        let error = win_error(ERROR_PARTIAL_COPY);
+        assert_eq!(error.kind(), ErrorKind::InvalidAddress);
+        assert_eq!(error.raw_code(), Some(ERROR_PARTIAL_COPY as i32));
     }
 
     #[test]
