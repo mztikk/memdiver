@@ -363,8 +363,10 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns an operating-system error wrapped in [`Error::Write`] when the
-    /// write fails, [`Error::AddressRange`] when the range overflows,
+    /// Returns [`Error::ReadOnly`] for a non-empty write through a read-only
+    /// handle (checked before range validation), an operating-system error
+    /// wrapped in [`Error::Write`] when the write fails,
+    /// [`Error::AddressRange`] when the range overflows,
     /// [`Error::AddressSpaceReplaced`] when the target replaced its address
     /// space after opening, or [`Error::PartialWrite`] when the operating
     /// system transfers fewer bytes than requested. On Windows a failed
@@ -431,12 +433,14 @@ impl Process {
     /// # Errors
     ///
     /// Returns [`Error::ReadOnly`] for a non-empty write through a read-only
-    /// handle, [`Error::AddressRange`] when the range overflows, and
-    /// [`Error::Write`] or [`Error::PartialWrite`] when the write itself fails
-    /// and all changed protections were restored. Returns [`Error::Protect`]
-    /// when the range is not fully committed or changing a page's protection
-    /// fails and the pages already changed were restored, and
-    /// [`Error::Unsupported`] when the platform cannot change protections.
+    /// handle, [`Error::AddressRange`] when the range overflows,
+    /// [`Error::AddressSpaceReplaced`] when the target replaced its address
+    /// space after opening, and [`Error::Write`] or [`Error::PartialWrite`]
+    /// when the write itself fails and all changed protections were restored.
+    /// Returns [`Error::Protect`] when the range is not fully committed or
+    /// changing a page's protection fails and the pages already changed were
+    /// restored, and [`Error::Unsupported`] when the platform cannot change
+    /// protections.
     ///
     /// If restoring a page also fails, returns [`Error::CodeWrite`] with both
     /// the write/protection failure and the restore failure, or
@@ -625,8 +629,9 @@ impl Process {
 
     /// Reads a plain-old-data value from `address`.
     ///
-    /// The value is copied out of an unaligned byte buffer, so `address` does
-    /// not have to satisfy `align_of::<T>()`. Only [`Pod`] types are accepted:
+    /// The value's bytes are read directly into its stack storage, and
+    /// `address` does not have to satisfy `align_of::<T>()`. Only [`Pod`] types
+    /// are accepted:
     /// types such as `bool`, `char`, references and enums cannot be read safely
     /// from arbitrary memory because not every bit pattern is valid.
     ///
@@ -640,7 +645,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Process::read_bytes`].
+    /// Returns the same errors as [`Process::read`]. A zero-sized value is
+    /// returned without accessing the target.
     pub fn read_value<T: Pod>(&self, address: Address) -> Result<T> {
         if size_of::<T>() == 0 {
             return Ok(T::zeroed());
@@ -834,7 +840,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidLength`] for an empty range,
+    /// Returns [`Error::ReadOnly`] for a read-only handle (checked before the
+    /// length), [`Error::InvalidLength`] for an empty range,
     /// [`Error::AddressRange`] when the range overflows,
     /// [`Error::InvalidProtection`] when the platform cannot represent the
     /// requested flags, [`Error::Protect`] when the operating system rejects the

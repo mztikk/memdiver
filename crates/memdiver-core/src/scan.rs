@@ -45,8 +45,9 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ModuleNotFound`] when the module is not loaded, or an
-    /// error when the region list cannot be enumerated.
+    /// Returns [`Error::ModuleNotFound`] when the module is not loaded, an error
+    /// when the region list cannot be enumerated, [`Error::Allocation`] for the
+    /// scan buffer, or the fatal scan error when the target goes away mid-scan.
     pub fn find_pattern_in_module(
         &self,
         module: &str,
@@ -77,8 +78,9 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns an error when the module or region list cannot be enumerated, or
-    /// when an output buffer cannot be allocated.
+    /// Returns an error when the module or region list cannot be enumerated,
+    /// [`Error::Allocation`] when an output buffer cannot be allocated, or the
+    /// fatal scan error when the target goes away mid-scan.
     pub fn find_patterns_in_modules(
         &self,
         pattern: &Pattern,
@@ -106,8 +108,9 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns an error when the region list cannot be enumerated or an output
-    /// buffer cannot be allocated.
+    /// Returns an error when the region list cannot be enumerated,
+    /// [`Error::Allocation`] when an output buffer cannot be allocated, or the
+    /// fatal scan error when the target goes away mid-scan.
     pub fn find_patterns(&self, pattern: &Pattern, options: &ScanOptions) -> Result<Vec<Address>> {
         let regions = self.scan_regions()?;
         let mut hits = Vec::new();
@@ -137,8 +140,10 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ModuleNotFound`] when the module is not loaded, an
-    /// error when the region list cannot be enumerated, or an allocation error.
+    /// Returns [`Error::ModuleNotFound`] when the module is not loaded, an error
+    /// when the region list cannot be enumerated, [`Error::Allocation`] for the
+    /// scan buffer or results, or the fatal scan error when the target goes away
+    /// mid-scan.
     pub fn find_patterns_in_module(
         &self,
         module: &str,

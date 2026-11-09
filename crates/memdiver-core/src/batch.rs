@@ -11,7 +11,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BatchRead`] when any entry fails.
+    /// Returns [`Error::BatchRead`] when any entry fails, or
+    /// [`Error::Allocation`] when the result vector cannot be allocated.
     pub fn read_many(&self, ranges: &[(Address, usize)]) -> Result<Vec<Vec<u8>>> {
         let mut results = Vec::new();
         results
