@@ -77,6 +77,8 @@ does not provide yet.
   write or a later protection change fails; restoration failures are reported
   as composite errors that keep both failures. On Linux the helper is a normal
   `/proc/<pid>/mem` write because protection changes are not needed.
+  Protection-changing operations through one handle are serialized; separate
+  handles to the same process are not coordinated.
 * **No silent truncation.** A read or write that transfers fewer bytes than
   requested returns `Error::PartialRead` / `Error::PartialWrite` with both
   counts. Nothing is quietly shortened. A stale Linux descriptor after a target

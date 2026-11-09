@@ -17,6 +17,10 @@ version is bumped for backwards-incompatible changes.
 - Linux: module files are opened through the pinned `/proc/<pid>` directory
   descriptor instead of constructing a fresh `/proc/<pid>/root` path, so a PID
   reused during export resolution cannot redirect the lookup.
+- Protection-changing operations (`write_code` and `protect`) are serialized per
+  handle, so concurrent calls through one handle cannot interleave their
+  protect/write/restore steps and leave a page writable and executable. Separate
+  handles are documented as uncoordinated.
 
 ## [0.2.0] - 2026-11-08
 

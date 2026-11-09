@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::mem::size_of;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use bytemuck::Pod;
 use memdiver_sys::ErrorKind as OsErrorKind;
@@ -58,7 +59,10 @@ impl ProcessAccess {
 /// `Process` is [`Send`] and [`Sync`]: reads and writes use positional I/O on
 /// Linux and thread-safe Win32 handle operations on Windows. Concurrent writes
 /// to overlapping ranges are forwarded to the operating system without
-/// additional ordering.
+/// additional ordering. Protection-changing operations (`write_code` and
+/// `protect`) are serialized per handle; separate handles to the same process
+/// are not coordinated, so callers must not change protection for the same page
+/// concurrently through different handles.
 ///
 /// # Security and safety
 ///
@@ -74,6 +78,10 @@ pub struct Process {
     pub(crate) pid: u32,
     access: ProcessAccess,
     pub(crate) inner: ProcessHandle,
+    /// Serializes protection-changing operations on this handle. Without it,
+    /// two threads can record and restore one page's protection in the wrong
+    /// order and leave the page writable and executable.
+    protection_lock: Mutex<()>,
 }
 
 impl fmt::Debug for Process {
@@ -111,7 +119,12 @@ impl Process {
     pub fn open_with(pid: u32, access: ProcessAccess) -> Result<Self> {
         let inner = ProcessHandle::open_with(pid, access.is_writable())
             .map_err(|source| open_error(pid, source))?;
-        Ok(Self { pid, access, inner })
+        Ok(Self {
+            pid,
+            access,
+            inner,
+            protection_lock: Mutex::new(()),
+        })
     }
 
     /// Opens a read-only handle to the process with the given PID.
@@ -369,6 +382,11 @@ impl Process {
     /// opened with [`ProcessAccess::ReadOnly`] rejects a non-empty write with
     /// [`Error::ReadOnly`] before any operating-system call.
     ///
+    /// Protection changes are serialized per handle, so two calls through this
+    /// handle cannot interleave their protect/write/restore steps. Calls through
+    /// different handles to the same process are not coordinated; do not patch
+    /// the same page through two handles at the same time.
+    ///
     /// A failed or partial write can still have modified the target; the
     /// helper restores protection but cannot undo the bytes that were already
     /// written.
@@ -410,6 +428,7 @@ impl Process {
                 operation: "Process::write_code",
             });
         }
+        let _protection = self.protection_guard();
         validate_range(self.pid, address, buffer.len())?;
         let len = buffer.len();
         match self.inner.write_code(address.get(), buffer) {
@@ -538,6 +557,17 @@ impl Process {
             len: restore.len,
             source: restore.source,
         }
+    }
+
+    /// Serializes protection-changing operations performed through this handle.
+    ///
+    /// Poisoning is ignored: a panic while holding the lock leaves the target's
+    /// page protection in an unknown state, but the caller still gets a result
+    /// rather than a second panic.
+    fn protection_guard(&self) -> MutexGuard<'_, ()> {
+        self.protection_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Reads a plain-old-data value from `address`.
@@ -742,6 +772,11 @@ impl Process {
     /// Linux does not allow one process to change another process's page
     /// protections; on Linux this returns [`Error::Unsupported`].
     ///
+    /// Protection changes through one handle are serialized with
+    /// [`Process::write_code`]. Separate handles to the same process are not
+    /// coordinated, so do not change protection for the same page through
+    /// different handles concurrently.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidLength`] for an empty range,
@@ -767,6 +802,7 @@ impl Process {
                 len,
             });
         }
+        let _protection = self.protection_guard();
         validate_range(self.pid, address, len)?;
         self.inner
             .protect(address.get(), len, protection)

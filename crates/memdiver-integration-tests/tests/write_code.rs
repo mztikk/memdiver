@@ -299,3 +299,61 @@ fn multi_page_code_write_restores_differing_protections() {
 
     fixture.ping();
 }
+
+#[cfg(windows)]
+#[test]
+fn concurrent_code_writes_to_one_page_restore_protection() {
+    let mut fixture = Fixture::spawn();
+    let target = fixture.multi_page_target();
+    assert!(
+        target.page_size >= 32,
+        "the test needs room for eight four-byte writes in one page"
+    );
+    let before = fixture
+        .process
+        .region_at(target.address)
+        .expect("first page region before writes")
+        .expect("first page mapped before writes");
+    let original = fixture
+        .process
+        .read_bytes(target.address, target.page_size)
+        .expect("read the first page");
+
+    // One handle serializes protection changes; the fixture's own handle is not
+    // used until every worker has joined.
+    let process = std::sync::Arc::new(Process::open(fixture.process.pid()).expect("second handle"));
+    let workers: Vec<_> = (0..8u64)
+        .map(|index| {
+            let process = std::sync::Arc::clone(&process);
+            let offset = (index as usize) * 4;
+            let bytes = original[offset..offset + 4].to_vec();
+            std::thread::spawn(move || {
+                let address = target.address.checked_add(index * 4).expect("byte address");
+                process
+                    .write_code(address, &bytes)
+                    .expect("concurrent code write");
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("code-write worker");
+    }
+
+    let after = fixture
+        .process
+        .region_at(target.address)
+        .expect("first page region after writes")
+        .expect("first page mapped after writes");
+    assert_eq!(
+        after.protection(),
+        before.protection(),
+        "the first page's original protection must survive concurrent writes"
+    );
+    assert_eq!(
+        fixture
+            .process
+            .read_bytes(target.address, target.page_size)
+            .expect("read the first page after writes"),
+        original
+    );
+}
