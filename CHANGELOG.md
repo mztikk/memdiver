@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 This project follows [SemVer](https://semver.org/). Before 1.0, the minor
 version is bumped for backwards-incompatible changes.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-09
 
 ### Breaking changes
 
@@ -107,6 +107,13 @@ version is bumped for backwards-incompatible changes.
   version address with the fixture's own `dlsym` result.
 - The harness now consumes the re-exec'd fixture's new `READY` line and removes
   a uniquely named fixture copy if construction unwinds.
+
+### Gate
+
+Run on the release tree: `just ci`, the release test suite, the
+`x86_64-pc-windows-gnu` cross-check/clippy, extra musl and 32-bit Windows
+checks, and package-content checks. MSRV 1.85 and native Windows runtime tests
+are covered by CI.
 
 ## [0.2.0] - 2026-11-08
 
