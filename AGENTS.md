@@ -274,7 +274,8 @@ in `memdiver-sys`.
   and anti-cheat can deny access even to elevated callers.
 * Windows `HANDLE`s remain valid after process exit; `WaitForSingleObject` with
   a zero timeout is the liveness check. A signaled handle means exited. Do not
-  use `GetExitCodeProcess == STILL_ACTIVE`, which is ambiguous.
+  use `GetExitCodeProcess == STILL_ACTIVE`, which is ambiguous. `open` checks the
+  new handle and rejects an already-terminated process as `ProcessExited`.
 * `ReadProcessMemory`/`WriteProcessMemory` may copy a partial buffer and still
   fail. The call is an error; never infer success from a non-zero byte count.
 

@@ -383,6 +383,10 @@ cat /proc/sys/kernel/yama/ptrace_scope
   guaranteed on x86/x86_64, so callers on ARM64 must not assume patched code is
   visible.
 * Guard pages are reported through `Protection::GUARD`.
+* Opening a process checks the newly opened handle with
+  `WaitForSingleObject(handle, 0)` and rejects an already-terminated process as
+  `ProcessExited`; a process that exits immediately after a successful open is
+  an inherent race detected by the next operation.
 * `wait_for_exit` uses `WaitForSingleObject` on the pinned handle.
 * PE exports are parsed from the module file and converted with
   `live_module_base + RVA`; forwarded exports and unnamed ordinals are skipped.

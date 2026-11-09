@@ -75,6 +75,26 @@ fn an_exited_fixture_is_not_alive_and_wait_reports_exit() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn opening_an_exited_process_is_rejected() {
+    let mut fixture = Fixture::spawn();
+    let pid = fixture.process.pid();
+    // The fixture's own Process handle keeps the terminated process object (and
+    // its PID) alive, so OpenProcess can still succeed for it.
+    fixture.kill();
+    let error = Process::open(pid).expect_err("a terminated process must not be reopened");
+    match error {
+        Error::Open { source, .. } => assert_eq!(
+            source.kind(),
+            memdiver::OsErrorKind::ProcessExited,
+            "a lingering terminated process must be classified as exited"
+        ),
+        Error::ProcessNotFound { .. } => {}
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 #[test]
 fn opening_a_nonexistent_process_reports_not_found() {
     let error = Process::open(u32::MAX).expect_err("PID u32::MAX must not exist");

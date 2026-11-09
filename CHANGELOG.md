@@ -66,6 +66,10 @@ version is bumped for backwards-incompatible changes.
 - `Module::contains` and module-scoped scans now use a module's exact mappings
   instead of its address span, so readable memory in an unmapped gap (or another
   module mapped inside the span) is no longer treated as part of the module.
+- Windows `OpenProcess` can succeed for a terminated process while another
+  handle keeps its object alive. `ProcessHandle::open` now checks the signaled
+  state and returns `ProcessExited` instead of a handle whose first operation
+  fails.
 - Windows process/module errors classify `ERROR_FILE_NOT_FOUND` and
   `ERROR_PATH_NOT_FOUND` as `NotFound`, and module enumeration checks the pinned
   handle's liveness before retrying an `ERROR_INVALID_HANDLE`/`ERROR_PARTIAL_COPY`

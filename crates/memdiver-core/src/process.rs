@@ -101,7 +101,9 @@ impl Process {
     ///
     /// Returns [`Error::ProcessNotFound`] when the process does not exist,
     /// [`Error::AccessDenied`] when the operating system denies access, and
-    /// [`Error::Open`] for other failures.
+    /// [`Error::Open`] for other failures, including a process that has already
+    /// exited or exits during the open (its source is classified
+    /// `ProcessExited`).
     pub fn open(pid: u32) -> Result<Self> {
         Self::open_with(pid, ProcessAccess::ReadWrite)
     }
@@ -116,7 +118,9 @@ impl Process {
     ///
     /// Returns [`Error::ProcessNotFound`] when the process does not exist,
     /// [`Error::AccessDenied`] when the operating system denies the requested
-    /// access, and [`Error::Open`] for other failures.
+    /// access, and [`Error::Open`] for other failures, including a process that
+    /// has already exited or exits during the open (its source is classified
+    /// `ProcessExited`).
     pub fn open_with(pid: u32, access: ProcessAccess) -> Result<Self> {
         let inner = ProcessHandle::open_with(pid, access.is_writable())
             .map_err(|source| open_error(pid, source))?;

@@ -92,9 +92,11 @@ impl ProcessHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::NotFound`] for an invalid PID or a process that has
-    /// already exited, [`ErrorKind::PermissionDenied`] when `OpenProcess` is
-    /// denied, and [`ErrorKind::Other`] for any other Win32 failure.
+    /// Returns [`ErrorKind::NotFound`] for an invalid PID,
+    /// [`ErrorKind::ProcessExited`] when the process has already terminated (its
+    /// object can linger while another handle keeps it alive),
+    /// [`ErrorKind::PermissionDenied`] when `OpenProcess` is denied, and
+    /// [`ErrorKind::Other`] for any other Win32 failure.
     pub fn open(pid: u32) -> Result<Self, Error> {
         Self::open_with(pid, true)
     }
@@ -106,9 +108,11 @@ impl ProcessHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::NotFound`] for an invalid PID or a process that has
-    /// already exited, [`ErrorKind::PermissionDenied`] when `OpenProcess` is
-    /// denied, and [`ErrorKind::Other`] for any other Win32 failure.
+    /// Returns [`ErrorKind::NotFound`] for an invalid PID,
+    /// [`ErrorKind::ProcessExited`] when the process has already terminated (its
+    /// object can linger while another handle keeps it alive),
+    /// [`ErrorKind::PermissionDenied`] when `OpenProcess` is denied, and
+    /// [`ErrorKind::Other`] for any other Win32 failure.
     pub fn open_with(pid: u32, writable: bool) -> Result<Self, Error> {
         if pid == 0 {
             return Err(Error::new(
@@ -137,6 +141,14 @@ impl ProcessHandle {
         }
 
         let handle = OwnedHandle::new(handle);
+        // A terminated process object can remain openable while another handle
+        // keeps it alive. Reject it here instead of returning a handle whose
+        // first operation fails.
+        match unsafe { WaitForSingleObject(handle.as_handle(), 0) } {
+            WAIT_OBJECT_0 => return Err(process_exited(pid)),
+            WAIT_TIMEOUT => {}
+            _ => return Err(last_error()),
+        }
         let creation_time = process_creation_time(handle.as_handle())?;
         Ok(Self {
             pid,
@@ -927,11 +939,7 @@ impl ProcessHandle {
         if self.is_alive() {
             Ok(())
         } else {
-            Err(Error::new(
-                ErrorKind::ProcessExited,
-                None,
-                format!("process {} has exited", self.pid),
-            ))
+            Err(process_exited(self.pid))
         }
     }
 }
@@ -1400,6 +1408,14 @@ fn validate_module_file_path(path: &Path) -> Result<(), Error> {
             path.display()
         ))),
     }
+}
+
+fn process_exited(pid: u32) -> Error {
+    Error::new(
+        ErrorKind::ProcessExited,
+        None,
+        format!("process {pid} has exited"),
+    )
 }
 
 fn last_error() -> Error {
