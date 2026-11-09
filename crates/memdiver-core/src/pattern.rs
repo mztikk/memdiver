@@ -104,6 +104,11 @@ impl Pattern {
         self.anchor
     }
 
+    /// Returns `true` when every byte is a full wildcard.
+    pub(crate) fn is_all_wildcards(&self) -> bool {
+        self.masks.iter().all(|mask| *mask == 0)
+    }
+
     pub(crate) fn matches_at(&self, haystack: &[u8]) -> bool {
         if haystack.len() < self.bytes.len() {
             return false;
@@ -223,6 +228,21 @@ mod tests {
         assert!(pattern.matches_at(&[0x48, 0x8B, 0x05, 0xAA, 0x4F, 0x3F, 0xA1]));
         assert!(pattern.matches_at(&[0x48, 0x8B, 0x05, 0x00, 0x4A, 0xFF, 0xAF]));
         assert!(!pattern.matches_at(&[0x48, 0x8B, 0x05, 0xAA, 0x5F, 0x3F, 0xA1]));
+    }
+
+    #[test]
+    fn detects_all_wildcard_patterns() {
+        assert!(
+            Pattern::parse("?? ? ??")
+                .expect("all wildcards")
+                .is_all_wildcards()
+        );
+        assert!(
+            !Pattern::parse("A? ??")
+                .expect("nibble mask")
+                .is_all_wildcards()
+        );
+        assert!(!Pattern::parse("AA").expect("exact").is_all_wildcards());
     }
 
     #[test]

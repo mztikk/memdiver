@@ -28,9 +28,18 @@ impl Process {
         let regions = self.scan_regions()?;
         let options = ScanOptions::default();
         let mut hits = Vec::new();
+        let mut buffer = Vec::new();
         for module in &modules {
             hits.clear();
-            self.scan_module(module, &regions, pattern, &options, 1, &mut hits)?;
+            self.scan_module(
+                module,
+                &regions,
+                pattern,
+                &options,
+                1,
+                &mut hits,
+                &mut buffer,
+            )?;
             if let Some(hit) = hits.first() {
                 return Ok(Some(*hit));
             }
@@ -78,6 +87,7 @@ impl Process {
     ) -> Result<Option<Address>> {
         let regions = self.scan_regions()?;
         let mut hits = Vec::new();
+        let mut buffer = Vec::new();
         self.scan_module(
             module,
             &regions,
@@ -85,6 +95,7 @@ impl Process {
             &ScanOptions::default(),
             1,
             &mut hits,
+            &mut buffer,
         )?;
         Ok(hits.first().copied())
     }
@@ -108,9 +119,18 @@ impl Process {
         let modules = self.modules()?;
         let regions = self.scan_regions()?;
         let mut hits = Vec::new();
+        let mut buffer = Vec::new();
         let limit = result_limit(options);
         for module in &modules {
-            self.scan_module(module, &regions, pattern, options, limit, &mut hits)?;
+            self.scan_module(
+                module,
+                &regions,
+                pattern,
+                options,
+                limit,
+                &mut hits,
+                &mut buffer,
+            )?;
             if hits.len() >= limit {
                 break;
             }
@@ -133,8 +153,9 @@ impl Process {
     pub fn find_patterns(&self, pattern: &Pattern, options: &ScanOptions) -> Result<Vec<Address>> {
         let regions = self.scan_regions()?;
         let mut hits = Vec::new();
+        let mut buffer = Vec::new();
         let limit = result_limit(options);
-        for range in scan_ranges(&regions, None) {
+        for range in scan_ranges(&regions, None)? {
             scan_range_with(
                 self.pid,
                 range.base,
@@ -143,7 +164,8 @@ impl Process {
                 options,
                 limit,
                 &mut hits,
-                |address, buffer| self.read(address, buffer),
+                &mut buffer,
+                |address, bytes| self.read(address, bytes),
             )?;
             if hits.len() >= limit {
                 break;
@@ -195,6 +217,7 @@ impl Process {
     ) -> Result<Vec<Address>> {
         let regions = self.scan_regions()?;
         let mut hits = Vec::new();
+        let mut buffer = Vec::new();
         self.scan_module(
             module,
             &regions,
@@ -202,10 +225,13 @@ impl Process {
             options,
             result_limit(options),
             &mut hits,
+            &mut buffer,
         )?;
         Ok(hits)
     }
 
+    // Mirrors the scan inputs plus the reusable chunk buffer.
+    #[allow(clippy::too_many_arguments)]
     fn scan_module(
         &self,
         module: &Module,
@@ -214,8 +240,9 @@ impl Process {
         options: &ScanOptions,
         limit: usize,
         hits: &mut Vec<Address>,
+        buffer: &mut Vec<u8>,
     ) -> Result<()> {
-        for range in scan_ranges(regions, Some(module)) {
+        for range in scan_ranges(regions, Some(module))? {
             scan_range_with(
                 self.pid,
                 range.base,
@@ -224,7 +251,8 @@ impl Process {
                 options,
                 limit,
                 hits,
-                |address, buffer| self.read(address, buffer),
+                buffer,
+                |address, bytes| self.read(address, bytes),
             )?;
             if hits.len() >= limit {
                 break;
@@ -251,9 +279,25 @@ struct ScanRange {
 /// boundary is still found; the underlying read works across adjacent mappings
 /// and the range stays inside readable memory. Module scans clip every region
 /// to the module span first.
-fn scan_ranges(regions: &[crate::Region], module: Option<&Module>) -> Vec<ScanRange> {
+fn scan_ranges(regions: &[crate::Region], module: Option<&Module>) -> Result<Vec<ScanRange>> {
     let mut ranges: Vec<ScanRange> = Vec::new();
-    for region in regions {
+    ranges
+        .try_reserve(regions.len())
+        .map_err(|source| Error::Allocation {
+            len: regions.len().saturating_mul(size_of::<ScanRange>()),
+            source,
+        })?;
+    // Regions are sorted by base. Skip the ones entirely before the module so a
+    // module scan does not walk the whole process map.
+    let candidates = match module {
+        Some(module) => {
+            let start = regions.partition_point(|region| region.end().get() <= module.base().get());
+            let end = regions.partition_point(|region| region.base().get() < module.end().get());
+            regions.get(start..end).unwrap_or_default()
+        }
+        None => regions,
+    };
+    for region in candidates {
         if !scan_region(region) {
             continue;
         }
@@ -271,7 +315,7 @@ fn scan_ranges(regions: &[crate::Region], module: Option<&Module>) -> Vec<ScanRa
             None => push_scan_range(&mut ranges, region.base().get(), region.end().get()),
         }
     }
-    ranges
+    Ok(ranges)
 }
 
 /// Appends a half-open range, merging it with the previous one when adjacent.
@@ -325,6 +369,7 @@ fn scan_range_with<F>(
     options: &ScanOptions,
     limit: usize,
     hits: &mut Vec<Address>,
+    buffer: &mut Vec<u8>,
     mut read: F,
 ) -> Result<()>
 where
@@ -346,13 +391,14 @@ where
         len: usize::MAX,
     })?;
 
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(max_buffer_len)
-        .map_err(|source| Error::Allocation {
-            len: max_buffer_len,
-            source,
-        })?;
+    if buffer.capacity() < max_buffer_len {
+        buffer
+            .try_reserve_exact(max_buffer_len.saturating_sub(buffer.len()))
+            .map_err(|source| Error::Allocation {
+                len: max_buffer_len,
+                source,
+            })?;
+    }
 
     let mut offset = 0u64;
     while offset < size && hits.len() < limit {
@@ -369,10 +415,12 @@ where
         if want < pattern_len {
             break;
         }
-        buffer.clear();
+        // Resize (rather than clear+resize) so the buffer is zero-filled at most
+        // once and the OS read overwrites the active prefix. Resizing to a
+        // smaller final chunk only truncates.
         buffer.resize(want, 0);
-        match read(address, &mut buffer) {
-            Ok(()) => scan_buffer(&buffer, address, pattern, options, limit, hits)?,
+        match read(address, &mut buffer[..want]) {
+            Ok(()) => scan_buffer(buffer, address, pattern, options, limit, hits)?,
             Err(error) if is_fatal_scan_error(&error) => return Err(error),
             Err(_) => {}
         }
@@ -396,6 +444,27 @@ fn scan_buffer(
     let last_start = buffer.len() - pattern_len;
     let alignment = options.alignment().max(1) as u64;
     let base_value = base.get();
+
+    if pattern.is_all_wildcards() {
+        // Every aligned start matches; avoid comparing the pattern at every
+        // byte, which is quadratic for a large wildcard run.
+        let mut candidate = 0usize;
+        while candidate <= last_start && hits.len() < limit {
+            let Some(absolute) = base_value.checked_add(candidate as u64) else {
+                break;
+            };
+            if alignment == 1 || absolute % alignment == 0 {
+                hits.try_reserve(1).map_err(|source| Error::Allocation {
+                    len: size_of::<Address>().saturating_mul(hits.len().saturating_add(1)),
+                    source,
+                })?;
+                hits.push(Address::new(absolute));
+            }
+            candidate += 1;
+        }
+        return Ok(());
+    }
+
     let mut search = 0usize;
 
     while search <= last_start && hits.len() < limit {
@@ -450,6 +519,7 @@ mod tests {
         limit: usize,
     ) -> Vec<Address> {
         let mut hits = Vec::new();
+        let mut buffer = Vec::new();
         scan_range_with(
             1,
             Address::new(base),
@@ -458,6 +528,7 @@ mod tests {
             options,
             limit,
             &mut hits,
+            &mut buffer,
             |address, buffer| {
                 let offset = usize::try_from(address.get() - base).expect("offset");
                 buffer.copy_from_slice(&data[offset..offset + buffer.len()]);
@@ -498,7 +569,7 @@ mod tests {
             test_region(0x5000, 0x1000, Protection::empty()),
             test_region(0x6000, 0x1000, Protection::READ),
         ];
-        let ranges = scan_ranges(&regions, None);
+        let ranges = scan_ranges(&regions, None).expect("ranges");
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].base, Address::new(0x1000));
         assert_eq!(ranges[0].size, 0x2000);
@@ -521,7 +592,7 @@ mod tests {
             test_region(0x1000, 0x1000, Protection::READ),
             test_region(0x2000, 0x1000, Protection::READ),
         ];
-        let ranges = scan_ranges(&regions, Some(&module));
+        let ranges = scan_ranges(&regions, Some(&module)).expect("ranges");
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].base, Address::new(0x1800));
         assert_eq!(ranges[0].size, 0x1000);
@@ -541,7 +612,7 @@ mod tests {
             test_region(0x2000, 0x100, Protection::READ),
             test_region(0x3000, 0x100, Protection::READ),
         ];
-        let ranges = scan_ranges(&regions, Some(&module));
+        let ranges = scan_ranges(&regions, Some(&module)).expect("ranges");
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].base, Address::new(0x1000));
         assert_eq!(ranges[0].size, 0x100);
@@ -603,6 +674,7 @@ mod tests {
         data[1] = 0xBB;
         let pattern = Pattern::parse("AA BB").expect("pattern");
         let mut hits = Vec::new();
+        let mut buffer = Vec::new();
         scan_range_with(
             1,
             Address::new(BASE),
@@ -611,6 +683,7 @@ mod tests {
             &ScanOptions::default(),
             10,
             &mut hits,
+            &mut buffer,
             |_, _| {
                 Err(Error::InvalidLength {
                     pid: 1,
@@ -633,6 +706,15 @@ mod tests {
         let pattern = Pattern::parse("?? AA BB CC").expect("pattern");
         let hits = run_scan(&data, &pattern, &ScanOptions::default(), 10);
         assert_eq!(hits, vec![Address::new(BASE + 9)]);
+    }
+
+    #[test]
+    fn all_wildcard_pattern_matches_every_start() {
+        let data = [0u8; 8];
+        let pattern = Pattern::parse("?? ??").expect("pattern");
+        let hits = run_scan(&data, &pattern, &ScanOptions::default(), 100);
+        let expected: Vec<Address> = (0..=6).map(|offset| Address::new(BASE + offset)).collect();
+        assert_eq!(hits, expected);
     }
 
     #[test]

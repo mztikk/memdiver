@@ -699,7 +699,8 @@ impl Process {
     /// Returns [`Error::Enumerate`] when the operating system cannot enumerate
     /// the regions or the procfs data cannot be parsed.
     pub fn regions(&self) -> Result<Vec<Region>> {
-        let mut regions: Vec<Region> = self
+        // The platform backend returns regions sorted by base.
+        Ok(self
             .inner
             .regions()
             .map_err(|source| Error::Enumerate {
@@ -709,9 +710,7 @@ impl Process {
             })?
             .into_iter()
             .map(Region::from_raw)
-            .collect();
-        regions.sort_by_key(Region::base);
-        Ok(regions)
+            .collect())
     }
 
     /// Returns a sorted region snapshot with binary-search lookups.
@@ -731,7 +730,8 @@ impl Process {
     /// This avoids resolving module paths on Windows, where a normal
     /// [`Process::regions`] call would also enumerate every module.
     pub(crate) fn scan_regions(&self) -> Result<Vec<Region>> {
-        let mut regions: Vec<Region> = self
+        // Sorted by base, like `regions`; scan_ranges relies on that order.
+        Ok(self
             .inner
             .regions_without_paths()
             .map_err(|source| Error::Enumerate {
@@ -741,9 +741,7 @@ impl Process {
             })?
             .into_iter()
             .map(Region::from_raw)
-            .collect();
-        regions.sort_by_key(Region::base);
-        Ok(regions)
+            .collect())
     }
 
     /// Finds the committed region containing `address`.
@@ -755,7 +753,10 @@ impl Process {
     ///
     /// Returns the same errors as [`Process::regions`].
     pub fn region_at(&self, address: Address) -> Result<Option<Region>> {
-        Ok(self.region_map()?.find(address).cloned())
+        Ok(self
+            .regions()?
+            .into_iter()
+            .find(|region| region.contains(address)))
     }
 
     /// Enumerates the executable modules loaded by the target process.
@@ -767,7 +768,8 @@ impl Process {
     /// Returns [`Error::Enumerate`] when the operating system cannot enumerate
     /// the modules or the procfs data cannot be parsed.
     pub fn modules(&self) -> Result<Vec<Module>> {
-        let mut modules: Vec<Module> = self
+        // The platform backend returns modules sorted by load address.
+        Ok(self
             .inner
             .modules()
             .map_err(|source| Error::Enumerate {
@@ -777,9 +779,7 @@ impl Process {
             })?
             .into_iter()
             .map(Module::from_raw)
-            .collect();
-        modules.sort_by_key(Module::base);
-        Ok(modules)
+            .collect())
     }
 
     /// Returns a sorted module snapshot with binary-search lookups.
@@ -803,7 +803,10 @@ impl Process {
     ///
     /// Returns the same errors as [`Process::modules`].
     pub fn module_at(&self, address: Address) -> Result<Option<Module>> {
-        Ok(self.module_map()?.find(address).cloned())
+        Ok(self
+            .modules()?
+            .into_iter()
+            .find(|module| module.contains(address)))
     }
 
     /// Finds a module by name.

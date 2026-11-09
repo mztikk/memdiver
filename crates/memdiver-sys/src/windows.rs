@@ -1090,8 +1090,22 @@ fn process_creation_time(handle: HANDLE) -> Result<u64, Error> {
 }
 
 fn query_image_path(handle: HANDLE) -> Result<Option<PathBuf>, Error> {
-    let mut buffer = vec![0u16; 32_768];
-    query_image_path_with_buffer(handle, &mut buffer)
+    // Start with room for a normal path and grow only when the OS reports the
+    // buffer too small; process enumeration already reuses a large buffer.
+    let mut capacity = 260usize;
+    loop {
+        let mut buffer = vec![0u16; capacity];
+        match query_image_path_with_buffer(handle, &mut buffer) {
+            Ok(path) => return Ok(path),
+            Err(error)
+                if error.raw_code() == Some(ERROR_INSUFFICIENT_BUFFER as i32)
+                    && capacity < 32_768 =>
+            {
+                capacity = capacity.saturating_mul(2).min(32_768);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn query_image_path_with_buffer(

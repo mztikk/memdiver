@@ -5,7 +5,7 @@ use memdiver_sys::ErrorKind as OsErrorKind;
 
 use crate::{Address, Error, Process, Result};
 
-const STRING_CHUNK_BYTES: usize = 256;
+const STRING_CHUNK_BYTES: usize = 4096;
 
 impl Process {
     /// Reads a NUL-terminated byte string.
@@ -39,7 +39,11 @@ impl Process {
     /// Returns the same errors as [`Process::read_c_string`].
     pub fn read_c_string_lossy(&self, address: Address, max_bytes: usize) -> Result<String> {
         let bytes = self.read_c_string(address, max_bytes)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            // Only allocate a replacement buffer when the bytes are not UTF-8.
+            Err(error) => Ok(String::from_utf8_lossy(error.as_bytes()).into_owned()),
+        }
     }
 
     /// Reads a NUL-terminated UTF-16LE string.

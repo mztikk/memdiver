@@ -312,27 +312,40 @@ impl ProcessHandle {
     /// Returns an error when the process exited, PID reuse is detected, or
     /// `/proc/<pid>/maps` cannot be read or parsed.
     pub fn regions(&self) -> Result<Vec<RawRegion>, Error> {
-        self.ensure_same_process()?;
-        let data = read_proc_file(&self.proc_dir, MAPS)?;
-        let entries = parse_maps(&data, self.pid)?;
-        // Check again after reading: a PID reused while `/proc/<pid>/maps` was
-        // open would otherwise produce regions that belong to another process.
-        self.ensure_same_process()?;
-        Ok(entries.into_iter().map(|entry| entry.region).collect())
+        Ok(self
+            .maps_snapshot(true)?
+            .into_iter()
+            .map(|entry| entry.region)
+            .collect())
     }
 
-    /// Enumerates committed regions without resolving module paths.
+    /// Enumerates committed regions without resolving file paths.
     ///
-    /// Linux always parses the pathname while reading `/proc/<pid>/maps`, so
-    /// this is equivalent to [`ProcessHandle::regions`]; it exists for API
-    /// parity with the Windows backend and for scan callers that do not need
-    /// paths.
+    /// File-backed mappings still report [`RegionKind::Mapped`], but `path` is
+    /// `None`; scans do not need it and avoiding the allocation saves work on
+    /// every chunk scan. Use [`ProcessHandle::regions`] when paths matter.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`ProcessHandle::regions`].
     pub fn regions_without_paths(&self) -> Result<Vec<RawRegion>, Error> {
-        self.regions()
+        Ok(self
+            .maps_snapshot(false)?
+            .into_iter()
+            .map(|entry| entry.region)
+            .collect())
+    }
+
+    /// Reads and parses `/proc/<pid>/maps` with a process-identity check on both
+    /// sides of the read.
+    fn maps_snapshot(&self, include_paths: bool) -> Result<Vec<MapsEntry>, Error> {
+        self.ensure_same_process()?;
+        let data = read_proc_file(&self.proc_dir, MAPS)?;
+        let entries = parse_maps(&data, self.pid, include_paths)?;
+        // Check again after reading: a PID reused while `/proc/<pid>/maps` was
+        // open would otherwise produce regions that belong to another process.
+        self.ensure_same_process()?;
+        Ok(entries)
     }
 
     /// Enumerates the executable modules loaded by the process.
@@ -348,11 +361,7 @@ impl ProcessHandle {
     /// Returns an error when the process exited, PID reuse is detected, or
     /// `/proc/<pid>/maps` cannot be read or parsed.
     pub fn modules(&self) -> Result<Vec<RawModule>, Error> {
-        self.ensure_same_process()?;
-        let data = read_proc_file(&self.proc_dir, MAPS)?;
-        let entries = parse_maps(&data, self.pid)?;
-        self.ensure_same_process()?;
-        Ok(modules_from_entries(&entries))
+        Ok(modules_from_entries(&self.maps_snapshot(true)?))
     }
 
     /// Reads a mapped module file through the target's root and returns its
@@ -374,10 +383,7 @@ impl ProcessHandle {
     /// mapped. Operating-system errors from opening or reading the file are
     /// preserved.
     pub fn read_module_file(&self, base: u64, path: &Path) -> Result<Vec<u8>, Error> {
-        self.ensure_same_process()?;
-        let data = read_proc_file(&self.proc_dir, MAPS)?;
-        let entries = parse_maps(&data, self.pid)?;
-        self.ensure_same_process()?;
+        let entries = self.maps_snapshot(true)?;
 
         let entry = entries
             .iter()
@@ -882,13 +888,13 @@ struct MapsEntry {
     file_id: Option<FileId>,
 }
 
-fn parse_maps(data: &[u8], pid: u32) -> Result<Vec<MapsEntry>, Error> {
+fn parse_maps(data: &[u8], pid: u32, include_paths: bool) -> Result<Vec<MapsEntry>, Error> {
     let mut entries = Vec::new();
     for (index, line) in data.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        let entry = parse_maps_line(line).map_err(|reason| {
+        let entry = parse_maps_line(line, include_paths).map_err(|reason| {
             Error::malformed(format!(
                 "/proc/{pid}/maps line {} is malformed: {reason}",
                 index + 1
@@ -900,7 +906,7 @@ fn parse_maps(data: &[u8], pid: u32) -> Result<Vec<MapsEntry>, Error> {
     Ok(entries)
 }
 
-fn parse_maps_line(line: &[u8]) -> Result<MapsEntry, String> {
+fn parse_maps_line(line: &[u8], include_paths: bool) -> Result<MapsEntry, String> {
     let mut position = 0;
     let range = next_field(line, &mut position).ok_or("missing address range")?;
     let permissions = next_field(line, &mut position).ok_or("missing permissions")?;
@@ -911,7 +917,7 @@ fn parse_maps_line(line: &[u8]) -> Result<MapsEntry, String> {
     let (base, end) = parse_range(range)?;
     let protection = parse_permissions(permissions)?;
 
-    let path = {
+    let path_bytes = {
         // The kernel pads the pathname column with spaces after the inode.
         // Skip the whole padding run; real paths are absolute and start with
         // '/', and special mappings start with '['.
@@ -921,21 +927,25 @@ fn parse_maps_line(line: &[u8]) -> Result<MapsEntry, String> {
         let bytes = line.get(position..).unwrap_or_default();
         // The kernel appends this marker for deleted mappings. A real file name
         // ending in the same text is indistinguishable; accept the ambiguity.
-        let bytes = bytes.strip_suffix(b" (deleted)").unwrap_or(bytes);
-        if bytes.is_empty() || bytes.first() == Some(&b'[') {
-            None
-        } else {
-            Some(PathBuf::from(OsString::from_vec(bytes.to_vec())))
-        }
+        bytes.strip_suffix(b" (deleted)").unwrap_or(bytes)
     };
-    let kind = if path.is_some() {
+    let has_path = !path_bytes.is_empty() && path_bytes.first() != Some(&b'[');
+    let path = if include_paths && has_path {
+        Some(PathBuf::from(OsString::from_vec(path_bytes.to_vec())))
+    } else {
+        None
+    };
+    let kind = if has_path {
         RegionKind::Mapped
     } else {
         RegionKind::Private
     };
-    let file_id = match &path {
-        Some(_) => Some(parse_file_id(device, inode)?),
-        None => None,
+    // Paths are only requested by region/module queries; a path-free scan does
+    // not need the file identity either.
+    let file_id = if include_paths && has_path {
+        Some(parse_file_id(device, inode)?)
+    } else {
+        None
     };
 
     Ok(MapsEntry {
@@ -1217,7 +1227,7 @@ mod tests {
     #[test]
     fn parses_regular_maps_entry() {
         let line = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 1234 /usr/lib/libfoo.so.1";
-        let entry = parse_maps_line(line).expect("valid maps line");
+        let entry = parse_maps_line(line, true).expect("valid maps line");
         let region = &entry.region;
         assert_eq!(region.base, 0x7f00_0000_0000);
         assert_eq!(region.size, 0x1000);
@@ -1237,8 +1247,20 @@ mod tests {
     }
 
     #[test]
+    fn path_free_parse_omits_paths_but_keeps_kind() {
+        let line = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 1234 /usr/lib/libfoo.so.1";
+        let entry = parse_maps_line(line, false).expect("valid maps line");
+        assert_eq!(entry.region.path, None);
+        assert_eq!(entry.region.kind, RegionKind::Mapped);
+        assert_eq!(entry.file_id, None);
+        let entry = parse_maps_line(line, true).expect("valid maps line");
+        assert!(entry.region.path.is_some());
+        assert!(entry.file_id.is_some());
+    }
+
+    #[test]
     fn parses_shared_and_write_only_permissions() {
-        let shared = parse_maps_line(b"1000-2000 rw-s 00000000 00:00 0 /tmp/shared")
+        let shared = parse_maps_line(b"1000-2000 rw-s 00000000 00:00 0 /tmp/shared", true)
             .expect("valid maps line");
         assert_eq!(
             shared.region.protection,
@@ -1246,7 +1268,7 @@ mod tests {
         );
 
         let write_only =
-            parse_maps_line(b"2000-3000 -w-p 00000000 00:00 0").expect("valid maps line");
+            parse_maps_line(b"2000-3000 -w-p 00000000 00:00 0", true).expect("valid maps line");
         assert_eq!(write_only.region.protection, Protection::WRITE);
         assert_eq!(write_only.region.path, None);
         assert_eq!(write_only.region.kind, RegionKind::Private);
@@ -1259,7 +1281,7 @@ mod tests {
             "1000-2000 rw-p 00000000 00:00 7",
             "/tmp/name with spaces (deleted)",
         );
-        let entry = parse_maps_line(&line).expect("valid maps line");
+        let entry = parse_maps_line(&line, true).expect("valid maps line");
         assert_eq!(
             entry.region.path.as_deref(),
             Some(Path::new("/tmp/name with spaces"))
@@ -1269,15 +1291,17 @@ mod tests {
     #[test]
     fn parses_pathname_column_padding() {
         let line = b"1000-2000 r-xp 00000000 00:00 1234                    /usr/lib/libfoo.so.1";
-        let entry = parse_maps_line(line).expect("valid padded maps line");
+        let entry = parse_maps_line(line, true).expect("valid padded maps line");
         assert_eq!(
             entry.region.path.as_deref(),
             Some(Path::new("/usr/lib/libfoo.so.1"))
         );
 
-        let heap =
-            parse_maps_line(b"2000-3000 rw-p 00000000 00:00 0                          [heap]")
-                .expect("valid padded heap line");
+        let heap = parse_maps_line(
+            b"2000-3000 rw-p 00000000 00:00 0                          [heap]",
+            true,
+        )
+        .expect("valid padded heap line");
         assert_eq!(heap.region.path, None);
         assert_eq!(heap.region.kind, RegionKind::Private);
     }
@@ -1287,15 +1311,15 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let line = b"1000-2000 r-xp 00000000 00:00 9 /tmp/name-\xff";
-        let entry = parse_maps_line(line).expect("valid maps line");
+        let entry = parse_maps_line(line, true).expect("valid maps line");
         let path = entry.region.path.expect("file-backed mapping has a path");
         assert_eq!(path.as_os_str().as_bytes(), b"/tmp/name-\xff");
     }
 
     #[test]
     fn special_mappings_have_no_path() {
-        let heap =
-            parse_maps_line(b"5555-6666 rw-p 00000000 00:00 0 [heap]").expect("valid maps line");
+        let heap = parse_maps_line(b"5555-6666 rw-p 00000000 00:00 0 [heap]", true)
+            .expect("valid maps line");
         assert_eq!(heap.region.path, None);
         assert_eq!(heap.region.kind, RegionKind::Private);
     }
@@ -1313,7 +1337,7 @@ mod tests {
         ];
         for line in invalid {
             assert!(
-                parse_maps_line(line).is_err(),
+                parse_maps_line(line, true).is_err(),
                 "line {:?} should be rejected",
                 String::from_utf8_lossy(line)
             );
@@ -1323,12 +1347,12 @@ mod tests {
     #[test]
     fn parse_maps_sorts_and_numbers_lines() {
         let data = b"2000-3000 rw-p 0 00:00 0 [heap]\n1000-2000 r-xp 0 00:00 0 /bin/app\n";
-        let entries = parse_maps(data, 7).expect("valid maps");
+        let entries = parse_maps(data, 7, true).expect("valid maps");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].region.base, 0x1000);
         assert_eq!(entries[1].region.base, 0x2000);
 
-        let error = parse_maps(b"1000-2000 rw-p 0 00:00 0\nbad\n", 7).expect_err("must fail");
+        let error = parse_maps(b"1000-2000 rw-p 0 00:00 0\nbad\n", 7, true).expect_err("must fail");
         assert_eq!(error.kind(), ErrorKind::MalformedData);
         assert!(error.message().contains("line 2"));
     }

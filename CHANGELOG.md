@@ -78,6 +78,14 @@ version is bumped for backwards-incompatible changes.
   before opening them, and refuses a PE file whose `SizeOfImage` does not match
   the loaded module. Both prevent a target-controlled path or replaced file from
   being parsed as the module.
+- Scan performance: one chunk buffer is reused across ranges and chunks (it is no
+  longer zero-filled before every read), module scans skip regions outside the
+  module, all-wildcard patterns take a linear path, and Linux path-free scans no
+  longer allocate a `PathBuf` per file-backed mapping. Core snapshots are no
+  longer re-sorted after the backends sort them, `region_at`/`module_at` find
+  one-shot entries without building a map, strings read 4 KiB chunks and move
+  valid UTF-8 out of the buffer, and Windows `exe_path` grows a small buffer
+  instead of allocating 64 KiB per call.
 - Module-name resolution is shared by `Process::module`, module-scoped scans and
   exports. Names use the platform's process-name rules, and a name that matches
   several modules now returns `Error::AmbiguousModuleName` instead of silently
