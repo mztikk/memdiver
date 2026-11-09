@@ -15,6 +15,10 @@
 //!   two-page allocation with differing protections
 //! * `ZERO` (Linux only) → `ZERO <address>` for an executable `/dev/zero`
 //!   mapping used to test device-backed module rejection
+//! * `BOUNDARY` → `BOUNDARY <address> <page_size>` for a page followed by an
+//!   unmapped/inaccessible page, used for short-transfer tests
+//! * `ADJACENT` → `ADJACENT <address> <page_size>` for two adjacent readable
+//!   pages with different protections, used for scan-coalescing tests
 //! * `EXEC` (Linux only) — replaces the fixture image with itself; the parent's
 //!   pinned memory descriptor becomes stale
 //! * `EXIT` → the fixture exits
@@ -53,6 +57,169 @@ struct MultiPageTarget {
     base: *mut std::ffi::c_void,
     len: usize,
     page_size: usize,
+}
+
+/// Two pages whose second page is inaccessible to the target's memory API.
+///
+/// The parent reads across the boundary to exercise short-transfer handling.
+struct BoundaryTarget {
+    base: *mut std::ffi::c_void,
+    page_size: usize,
+}
+
+/// Two adjacent readable pages with different protections.
+///
+/// A pattern spanning the boundary is only found when a scan coalesces the two
+/// mappings.
+struct AdjacentTarget {
+    base: *mut std::ffi::c_void,
+    page_size: usize,
+}
+
+fn page_size() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf has no pointer preconditions and _SC_PAGESIZE is a
+        // valid name.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0, "sysconf(_SC_PAGESIZE) failed");
+        page as usize
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        // SAFETY: SYSTEM_INFO is plain-old-data and zero is a valid initial
+        // value.
+        let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: GetSystemInfo writes the struct to the provided pointer.
+        unsafe { GetSystemInfo(&mut info) };
+        let page = info.dwPageSize as usize;
+        assert!(page > 0, "GetSystemInfo returned a zero page size");
+        page
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn boundary_target() -> BoundaryTarget {
+    use std::ptr;
+
+    let page = page_size();
+    let len = page.checked_mul(2).expect("two pages fit in usize");
+    // SAFETY: a null address lets the kernel choose a page-aligned range. The
+    // returned pointer is checked and owns `len` writable bytes.
+    let base = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(base, libc::MAP_FAILED, "mmap boundary target");
+    // SAFETY: the first page is mapped and writable for `page` bytes.
+    unsafe { ptr::write_bytes(base.cast::<u8>(), b'x', page) };
+    // Remove the second page so a read crossing the boundary is short. A
+    // PROT_NONE page is not enough: /proc/<pid>/mem uses FOLL_FORCE on Linux.
+    // SAFETY: the second page is part of the mapping created above.
+    let unmapped = unsafe { libc::munmap(base.cast::<u8>().add(page).cast(), page) };
+    assert_eq!(unmapped, 0, "munmap boundary second page");
+    BoundaryTarget {
+        base,
+        page_size: page,
+    }
+}
+
+#[cfg(windows)]
+fn boundary_target() -> BoundaryTarget {
+    use std::ptr;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
+        VirtualAlloc, VirtualProtect,
+    };
+
+    let page = page_size();
+    let len = page.checked_mul(2).expect("two pages fit in usize");
+    // SAFETY: a null base asks the OS to choose a page-aligned range. The
+    // returned pointer is checked and owns `len` bytes.
+    let base = unsafe { VirtualAlloc(ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+    assert!(!base.is_null(), "VirtualAlloc boundary target");
+    // SAFETY: the first page is mapped and writable for `page` bytes.
+    unsafe { ptr::write_bytes(base.cast::<u8>(), b'x', page) };
+    let mut previous: PAGE_PROTECTION_FLAGS = 0;
+    let second = base.cast::<u8>().wrapping_add(page);
+    // SAFETY: the second page is part of the allocation and `previous` is
+    // writable for one value. No later access to this page is intended.
+    let changed = unsafe { VirtualProtect(second.cast(), page, PAGE_NOACCESS, &mut previous) };
+    assert_ne!(changed, 0, "VirtualProtect boundary second page");
+    BoundaryTarget {
+        base,
+        page_size: page,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn adjacent_target() -> AdjacentTarget {
+    use std::ptr;
+
+    let page = page_size();
+    let len = page.checked_mul(2).expect("two pages fit in usize");
+    // SAFETY: a null address lets the kernel choose a page-aligned range. The
+    // returned pointer is checked and owns `len` writable bytes.
+    let base = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(base, libc::MAP_FAILED, "mmap adjacent target");
+    let bytes = pattern(len).into_boxed_slice();
+    // SAFETY: `base` is writable for `len` bytes and `bytes` has that length.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.cast::<u8>(), len) };
+    // Split the mapping into two adjacent readable VMAs with different
+    // protections so scan coalescing is observable.
+    // SAFETY: the second page is part of the mapping created above.
+    let changed =
+        unsafe { libc::mprotect(base.cast::<u8>().add(page).cast(), page, libc::PROT_READ) };
+    assert_eq!(changed, 0, "mprotect adjacent second page");
+    AdjacentTarget {
+        base,
+        page_size: page,
+    }
+}
+
+#[cfg(windows)]
+fn adjacent_target() -> AdjacentTarget {
+    use std::ptr;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualProtect,
+    };
+
+    let page = page_size();
+    let len = page.checked_mul(2).expect("two pages fit in usize");
+    // SAFETY: a null base asks the OS to choose a page-aligned range. The
+    // returned pointer is checked and owns `len` bytes.
+    let base = unsafe { VirtualAlloc(ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+    assert!(!base.is_null(), "VirtualAlloc adjacent target");
+    let bytes = pattern(len).into_boxed_slice();
+    // SAFETY: `base` is writable for `len` bytes and `bytes` has that length.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.cast::<u8>(), len) };
+    let mut previous: PAGE_PROTECTION_FLAGS = 0;
+    let second = base.cast::<u8>().wrapping_add(page);
+    // SAFETY: the second page is part of the allocation and `previous` is
+    // writable for one value.
+    let changed = unsafe { VirtualProtect(second.cast(), page, PAGE_READONLY, &mut previous) };
+    assert_ne!(changed, 0, "VirtualProtect adjacent second page");
+    AdjacentTarget {
+        base,
+        page_size: page,
+    }
 }
 
 /// A Linux-only executable mapping of `/dev/zero`.
@@ -184,12 +351,17 @@ fn main() -> io::Result<()> {
 
     let buffer = pattern(BUFFER_LEN);
     let code_address = code_target as *const () as usize;
+    // Create the adjacency and platform targets first. The boundary target
+    // unmaps its second page, and a later mmap in this process could reuse that
+    // address; creating it last keeps the hole free for the test.
+    let adjacent = adjacent_target();
     #[cfg(windows)]
     let multi_page = multi_page_target();
     #[cfg(target_os = "linux")]
     let zero_address = zero_target();
     #[cfg(target_os = "linux")]
     std::hint::black_box(zero_address);
+    let boundary = boundary_target();
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -217,6 +389,16 @@ fn main() -> io::Result<()> {
             )?,
             #[cfg(target_os = "linux")]
             Some("ZERO") => writeln!(output, "ZERO {zero_address}")?,
+            Some("BOUNDARY") => writeln!(
+                output,
+                "BOUNDARY {} {}",
+                boundary.base as usize, boundary.page_size
+            )?,
+            Some("ADJACENT") => writeln!(
+                output,
+                "ADJACENT {} {}",
+                adjacent.base as usize, adjacent.page_size
+            )?,
             Some("PEEK") => {
                 let offset = fields.next().and_then(|value| value.parse::<usize>().ok());
                 let len = fields.next().and_then(|value| value.parse::<usize>().ok());

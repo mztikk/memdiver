@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -128,7 +128,11 @@ impl Fixture {
             permissions.set_mode(0o755);
             std::fs::set_permissions(&path, permissions).expect("make fixture copy executable");
         }
-        Self::spawn_from(&path, Some(path.clone()))
+        // Remove the copy if the handshake panics before a Fixture owns it.
+        let mut cleanup = RemoveOnDrop(Some(path.clone()));
+        let fixture = Self::spawn_from(&path, Some(path.clone()));
+        cleanup.0 = None;
+        fixture
     }
 
     /// Returns the executable name the fixture was started from.
@@ -303,6 +307,36 @@ impl Fixture {
         Address::new(fields[1].parse().expect("zero target address"))
     }
 
+    /// Returns the address and page size of the short-transfer target.
+    ///
+    /// The first page is readable and the next page is inaccessible, so a read
+    /// that crosses the boundary transfers only the readable prefix.
+    pub fn boundary_target(&mut self) -> (Address, usize) {
+        self.page_pair_target("BOUNDARY")
+    }
+
+    /// Returns the address and page size of two adjacent readable pages with
+    /// different protections.
+    pub fn adjacent_target(&mut self) -> (Address, usize) {
+        self.page_pair_target("ADJACENT")
+    }
+
+    fn page_pair_target(&mut self, command: &str) -> (Address, usize) {
+        self.request(command);
+        let response = self.response();
+        let fields: Vec<&str> = response.split_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            3,
+            "unexpected {command} response: {response:?}"
+        );
+        assert_eq!(fields[0], command);
+        let address: u64 = fields[1].parse().expect("target address");
+        let page_size: usize = fields[2].parse().expect("target page size");
+        assert!(page_size > 0, "fixture reported a zero page size");
+        (Address::new(address), page_size)
+    }
+
     /// Asks the fixture to exit without reaping it.
     ///
     /// This lets a test observe a zombie on Linux and a signaled process on
@@ -314,10 +348,23 @@ impl Fixture {
     /// Replaces the fixture image with itself.
     ///
     /// This keeps the PID and start time but installs a new address space, so
-    /// a handle opened before the call must report `AddressSpaceReplaced`.
+    /// a handle opened before the call must report `AddressSpaceReplaced`. The
+    /// new image prints a fresh `READY` line, which is consumed and used to
+    /// refresh the buffer address and length.
     #[cfg(target_os = "linux")]
     pub fn exec(&mut self) {
         self.request("EXEC");
+        let ready = self.response();
+        let fields: Vec<&str> = ready.split_whitespace().collect();
+        assert_eq!(fields.len(), 4, "unexpected READY line: {ready:?}");
+        assert_eq!(fields[0], "READY");
+        let pid: u32 = fields[1].parse().expect("fixture pid");
+        let address: u64 = fields[2].parse().expect("fixture address");
+        let len: usize = fields[3].parse().expect("fixture length");
+        assert_eq!(pid, self.child.id(), "the re-exec must keep the PID");
+        assert_eq!(len, BUFFER_LEN, "unexpected re-exec buffer length");
+        self.address = Address::new(address);
+        self.len = len;
     }
 
     /// Kills and reaps the fixture process.
@@ -349,6 +396,17 @@ impl Drop for Fixture {
             let _ = reader.join();
         }
         if let Some(path) = self.exe_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Removes a temporary fixture copy if construction unwinds.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
             let _ = std::fs::remove_file(path);
         }
     }

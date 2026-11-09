@@ -124,6 +124,47 @@ fn region_scans_find_heap_patterns_that_module_scans_do_not() {
 }
 
 #[test]
+fn finds_pattern_across_adjacent_readable_mappings() {
+    let mut fixture = Fixture::spawn();
+    let (address, page_size) = fixture.adjacent_target();
+    let start = address
+        .checked_add((page_size - 8) as u64)
+        .expect("boundary start");
+    let second = address.checked_add(page_size as u64).expect("second page");
+    let first_region = fixture
+        .process
+        .region_at(address)
+        .expect("first region")
+        .expect("first page mapped");
+    let second_region = fixture
+        .process
+        .region_at(second)
+        .expect("second region")
+        .expect("second page mapped");
+    assert!(first_region.is_readable());
+    assert!(second_region.is_readable());
+    assert_ne!(
+        first_region.protection(),
+        second_region.protection(),
+        "the fixture must split the two pages into different protections"
+    );
+
+    let boundary_bytes = fixture
+        .process
+        .read_bytes(start, 16)
+        .expect("read across the adjacent mapping boundary");
+    let pattern = pattern_for(&boundary_bytes);
+    let hits = fixture
+        .process
+        .find_patterns(&pattern, &ScanOptions::new().with_max_results(0))
+        .expect("scan all readable memory");
+    assert!(
+        hits.contains(&start),
+        "the pattern spanning the mapping boundary must be found: {hits:?}"
+    );
+}
+
+#[test]
 fn wildcard_and_nibble_masks_match() {
     let fixture = Fixture::spawn();
     let bytes = [0xA1u8, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18];

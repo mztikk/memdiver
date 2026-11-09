@@ -292,6 +292,22 @@ fn reads_bounded_utf16_strings() {
 }
 
 #[test]
+fn c_string_prefix_at_a_mapping_boundary() {
+    let mut fixture = Fixture::spawn();
+    let (address, page_size) = fixture.boundary_target();
+    let start = address
+        .checked_add((page_size - 8) as u64)
+        .expect("boundary start");
+    assert_eq!(
+        fixture
+            .process
+            .read_c_string(start, 16)
+            .expect("the readable prefix must be returned"),
+        vec![b'x'; 8]
+    );
+}
+
+#[test]
 fn long_strings_span_read_chunks() {
     let fixture = Fixture::spawn();
 

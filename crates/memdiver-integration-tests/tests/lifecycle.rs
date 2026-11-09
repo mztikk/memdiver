@@ -106,6 +106,24 @@ fn opening_a_nonexistent_process_reports_not_found() {
 }
 
 #[test]
+fn scanning_a_dead_process_is_an_error() {
+    let mut fixture = Fixture::spawn();
+    fixture.kill();
+    let pattern = memdiver::Pattern::parse("AA").expect("pattern");
+    let error = fixture
+        .process
+        .find_patterns(&pattern, &memdiver::ScanOptions::default())
+        .expect_err("a dead process must abort a scan instead of reporting no hits");
+    assert!(
+        matches!(
+            error,
+            Error::Enumerate { .. } | Error::AddressSpaceReplaced { .. } | Error::Read { .. }
+        ),
+        "unexpected {error:?}"
+    );
+}
+
+#[test]
 fn self_access_works_and_matches_regions() {
     let process = Process::open(std::process::id()).expect("open self");
     let marker = std::hint::black_box(0x1234_5678_9abc_def0u64);

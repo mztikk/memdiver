@@ -149,6 +149,34 @@ fn rejects_overflowing_ranges_without_an_os_call() {
 }
 
 #[test]
+fn short_read_at_a_mapping_boundary_reports_partial() {
+    let mut fixture = Fixture::spawn();
+    let (address, page_size) = fixture.boundary_target();
+    let start = address
+        .checked_add((page_size - 4) as u64)
+        .expect("boundary start");
+    let mut buffer = [0u8; 8];
+    let error = fixture
+        .process
+        .read(start, &mut buffer)
+        .expect_err("a range crossing into an inaccessible page must fail");
+    match error {
+        Error::PartialRead {
+            pid,
+            address: reported,
+            requested,
+            transferred,
+        } => {
+            assert_eq!(pid, fixture.process.pid());
+            assert_eq!(reported, start);
+            assert_eq!(requested, 8);
+            assert_eq!(transferred, 4, "only the readable prefix is transferred");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn reports_allocation_failure_for_impossible_buffers() {
     let fixture = Fixture::spawn();
     let error = fixture

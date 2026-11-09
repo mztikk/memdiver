@@ -125,6 +125,32 @@ fn modules_include_the_fixture_executable() {
 }
 
 #[test]
+fn snapshot_maps_match_the_vectors() {
+    let fixture = Fixture::spawn();
+    let regions = fixture.process.regions().expect("regions");
+    let region_map = fixture.process.region_map().expect("region map");
+    assert_eq!(region_map.len(), regions.len());
+    assert_eq!(region_map.is_empty(), regions.is_empty());
+    assert_eq!(region_map.regions(), regions.as_slice());
+    for region in &regions {
+        assert_eq!(
+            region_map.find(region.base()).map(|found| found.base()),
+            Some(region.base())
+        );
+    }
+    assert!(region_map.find(Address::NULL).is_none());
+
+    let modules = fixture.process.modules().expect("modules");
+    let module_map = fixture.process.module_map().expect("module map");
+    assert_eq!(module_map.len(), modules.len());
+    assert_eq!(module_map.is_empty(), modules.is_empty());
+    assert_eq!(module_map.modules(), modules.as_slice());
+    for module in &modules {
+        assert_eq!(module_map.find(module.base()), Some(module));
+    }
+}
+
+#[test]
 fn empty_protection_ranges_are_rejected() {
     let fixture = Fixture::spawn();
     let error = fixture
@@ -190,56 +216,73 @@ fn linux_special_mappings_are_private_and_paths_are_absolute() {
 #[cfg(windows)]
 #[test]
 fn protection_can_be_changed_and_restored_on_windows() {
-    let fixture = Fixture::spawn();
-    let page = Address::new(fixture.address.get() & !0xfff);
-    let page_len = 0x1000;
-
-    let error = fixture
+    let mut fixture = Fixture::spawn();
+    let target = fixture.multi_page_target();
+    let second = target
+        .address
+        .checked_add(target.page_size as u64)
+        .expect("second page");
+    let before = fixture
         .process
-        .protect(page, page_len, Protection::WRITE)
-        .expect_err("write-only protections are not representable");
-    assert!(
-        matches!(error, Error::InvalidProtection { .. }),
-        "unexpected {error:?}"
-    );
-
-    let error = fixture
+        .region_at(second)
+        .expect("region query")
+        .expect("second page must be mapped");
+    assert!(before.is_readable(), "{before:?}");
+    assert!(!before.is_writable(), "{before:?}");
+    let original = fixture
         .process
-        .protect(page, page_len, Protection::WRITE | Protection::EXECUTE)
-        .expect_err("write+execute without read is not representable");
-    assert!(
-        matches!(error, Error::InvalidProtection { .. }),
-        "unexpected {error:?}"
-    );
+        .read_bytes(target.address, target.len)
+        .expect("read the multi-page target");
+
+    for invalid in [Protection::WRITE, Protection::WRITE | Protection::EXECUTE] {
+        let error = fixture
+            .process
+            .protect(second, target.page_size, invalid)
+            .expect_err("Windows cannot represent this protection");
+        assert!(
+            matches!(error, Error::InvalidProtection { .. }),
+            "unexpected {error:?}"
+        );
+    }
 
     let previous = fixture
         .process
-        .protect(page, page_len, Protection::READ)
-        .expect("make the buffer page read-only");
-    assert!(previous.is_readable());
-    assert!(previous.is_writable());
-
-    let read_only = fixture
+        .protect(
+            second,
+            target.page_size,
+            Protection::READ | Protection::WRITE,
+        )
+        .expect("make the second page writable");
+    assert_eq!(previous, Protection::READ);
+    let changed = fixture
         .process
-        .region_at(fixture.address)
-        .expect("region query")
-        .expect("buffer region");
-    assert_eq!(read_only.protection(), Protection::READ);
+        .region_at(second)
+        .expect("region query after protect")
+        .expect("second page still mapped");
+    assert!(changed.is_readable());
+    assert!(changed.is_writable());
 
     let restored = fixture
         .process
-        .protect(page, page_len, previous)
-        .expect("restore protection");
-    assert!(restored.is_readable());
+        .protect(second, target.page_size, previous)
+        .expect("restore the second page");
+    assert_eq!(restored, Protection::READ);
     let after = fixture
         .process
-        .region_at(fixture.address)
+        .region_at(second)
         .expect("region query after restore")
-        .expect("buffer region after restore");
+        .expect("second page still mapped");
     assert_eq!(
         after.protection(),
-        previous,
-        "the restore call must leave the page with its original protection"
+        before.protection(),
+        "the original protection must be restored"
     );
-    assert!(fixture.process.read_bytes(fixture.address, 16).is_ok());
+    assert_eq!(
+        fixture
+            .process
+            .read_bytes(target.address, target.len)
+            .expect("read the multi-page target after restore"),
+        original,
+        "changing and restoring protection must not alter the bytes"
+    );
 }

@@ -91,6 +91,19 @@ version is bumped for backwards-incompatible changes.
   several modules now returns `Error::AmbiguousModuleName` instead of silently
   selecting the first one.
 
+### Tests
+
+- Added fixture targets for a short-transfer page boundary (`BOUNDARY`) and two
+  adjacent readable mappings with different protections (`ADJACENT`). Tests
+  cover a real `PartialRead` and C-string readable prefix at a mapping end, a
+  pattern spanning adjacent mappings, a scan after process exit, the snapshot
+  map APIs, a Windows protection round trip on the fixture's `MULTI` target, and
+  concurrent code writes to one page.
+- Added a synthetic PE export table covering named, forwarded and ordinal-only
+  exports.
+- The harness now consumes the re-exec'd fixture's new `READY` line and removes
+  a uniquely named fixture copy if construction unwinds.
+
 ## [0.2.0] - 2026-11-08
 
 This release contains breaking changes to the public error types and to several

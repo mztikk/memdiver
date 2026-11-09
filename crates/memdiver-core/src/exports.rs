@@ -363,20 +363,88 @@ mod tests {
         }
     }
 
+    fn put16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// A minimal PE32+ image with one section that contains an export directory.
+    ///
+    /// Exports: one normal function named `Normal`, one forwarded export named
+    /// `Forwarded`, and one ordinal-only function. Only `Normal` is a usable
+    /// export address.
+    fn pe_with_exports() -> Vec<u8> {
+        let mut pe = vec![0u8; 0x600];
+        pe[0..2].copy_from_slice(b"MZ");
+        put32(&mut pe, 0x3c, 0x40);
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        put16(&mut pe, 0x44, 0x8664); // machine
+        put16(&mut pe, 0x46, 1); // sections
+        put16(&mut pe, 0x54, 0xF0); // optional header size
+        put16(&mut pe, 0x56, 0x22); // characteristics
+
+        let optional = 0x58;
+        put16(&mut pe, optional, 0x20B); // PE32+
+        put32(&mut pe, optional + 4, 0x200); // size of code
+        put32(&mut pe, optional + 16, 0x1000); // entry point
+        put32(&mut pe, optional + 20, 0x1000); // base of code
+        put64(&mut pe, optional + 24, 0x1_4000_0000); // image base
+        put32(&mut pe, optional + 32, 0x1000); // section alignment
+        put32(&mut pe, optional + 36, 0x200); // file alignment
+        put16(&mut pe, optional + 40, 6);
+        put16(&mut pe, optional + 48, 6);
+        put32(&mut pe, optional + 56, 0x2000); // size of image
+        put32(&mut pe, optional + 60, 0x200); // size of headers
+        put16(&mut pe, optional + 68, 3); // console subsystem
+        put64(&mut pe, optional + 72, 0x10_0000);
+        put64(&mut pe, optional + 80, 0x1000);
+        put64(&mut pe, optional + 88, 0x10_0000);
+        put64(&mut pe, optional + 96, 0x1000);
+        put32(&mut pe, optional + 108, 16); // data directories
+        put32(&mut pe, optional + 112, 0x1000); // export RVA
+        put32(&mut pe, optional + 116, 0x100); // export size
+
+        let section = 0x148;
+        pe[section..section + 6].copy_from_slice(b".edata");
+        put32(&mut pe, section + 8, 0x1000); // virtual size
+        put32(&mut pe, section + 12, 0x1000); // virtual address
+        put32(&mut pe, section + 16, 0x400); // raw size
+        put32(&mut pe, section + 20, 0x200); // raw pointer
+        put32(&mut pe, section + 36, 0x4000_0040); // initialized data, read
+
+        // Export directory at RVA 0x1000 / file offset 0x200.
+        let edata = 0x200;
+        put32(&mut pe, edata + 12, 0x1100); // dll name RVA
+        put32(&mut pe, edata + 16, 1); // ordinal base
+        put32(&mut pe, edata + 20, 3); // address table entries
+        put32(&mut pe, edata + 24, 2); // name pointers
+        put32(&mut pe, edata + 28, 0x1040); // address table RVA
+        put32(&mut pe, edata + 32, 0x104C); // name pointer RVA
+        put32(&mut pe, edata + 36, 0x1058); // ordinal table RVA
+
+        put32(&mut pe, edata + 0x40, 0x1200); // Normal
+        put32(&mut pe, edata + 0x44, 0x1080); // Forwarded (inside export dir)
+        put32(&mut pe, edata + 0x48, 0x1210); // ordinal-only
+        put32(&mut pe, edata + 0x4C, 0x1110); // "Normal"
+        put32(&mut pe, edata + 0x50, 0x1120); // "Forwarded"
+        put16(&mut pe, edata + 0x58, 0); // Normal -> function 0
+        put16(&mut pe, edata + 0x5A, 1); // Forwarded -> function 1
+        pe[edata + 0x80..edata + 0x8B].copy_from_slice(b"other.Func\0");
+        pe[edata + 0x100..edata + 0x109].copy_from_slice(b"test.dll\0");
+        pe[edata + 0x110..edata + 0x117].copy_from_slice(b"Normal\0");
+        pe[edata + 0x120..edata + 0x12A].copy_from_slice(b"Forwarded\0");
+        pe
+    }
+
     /// A minimal PE32+ image whose export data directory points outside the
     /// file. Goblin parses the image but silently drops the malformed export
     /// table, which is exactly the case the library must report.
     fn pe_with_corrupt_export_directory() -> Vec<u8> {
-        fn put16(bytes: &mut [u8], offset: usize, value: u16) {
-            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-        }
-        fn put32(bytes: &mut [u8], offset: usize, value: u32) {
-            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        fn put64(bytes: &mut [u8], offset: usize, value: u64) {
-            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        }
-
         let mut pe = vec![0u8; 0x400];
         pe[0..2].copy_from_slice(b"MZ");
         put32(&mut pe, 0x3c, 0x40);
@@ -448,6 +516,21 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn skips_pe_forwarders_and_ordinal_only_exports() {
+        let module = Module::from_raw(memdiver_sys::RawModule {
+            name: "test.dll".to_owned(),
+            path: std::path::PathBuf::from("/test.dll"),
+            base: 0x1000,
+            size: 0x2000,
+            mappings: vec![(0x1000, 0x3000)],
+        });
+        let exports = parse_exports(42, &module, &pe_with_exports()).expect("valid PE exports");
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(exports[0].name(), "Normal");
+        assert_eq!(exports[0].address(), Address::new(0x2200));
     }
 
     #[test]

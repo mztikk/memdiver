@@ -478,9 +478,11 @@ writes its heap buffer through the public API, and verifies the results from the
 child's point of view. It also exercises process discovery and by-name opening,
 read-only handles, regions, modules, pattern and typed-value scanning (including
 a signature embedded in the fixture's executable), pointer chains, bounded
-strings, batched transfers, scoped code writes, waiting for exit, module exports
-against libc/ntdll, protection changes (Windows), the opt-in privilege helper,
-liveness, process-identity verification, errors, and concurrent access.
+strings (including a readable prefix at a mapping boundary), batched transfers,
+scoped code writes, waiting for exit, module exports against libc/ntdll,
+protection changes (Windows), the opt-in privilege helper, liveness,
+process-identity verification, short transfers at mapping boundaries, scans
+across adjacent mappings and after process exit, errors, and concurrent access.
 
 Windows behaviour is type-checked and linted on Linux via the
 `x86_64-pc-windows-gnu` target and fully executed on Windows in CI. See

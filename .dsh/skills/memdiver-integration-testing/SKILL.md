@@ -48,7 +48,9 @@ Then it reads one command per line and writes one response line:
 | `CODE` | `CODE <address> <length>` for the executable code target |
 | `MULTI` | Windows only: `MULTI <address> <length> <page_size>` for the two-page target |
 | `ZERO` | Linux only: `ZERO <address>` for the executable `/dev/zero` mapping |
-| `EXEC` | Linux only: re-executes the fixture (the pinned descriptor becomes stale) |
+| `BOUNDARY` | `BOUNDARY <address> <page_size>`: a readable page followed by an inaccessible one |
+| `ADJACENT` | `ADJACENT <address> <page_size>`: two adjacent readable pages with different protections |
+| `EXEC` | Linux only: re-executes the fixture (the pinned descriptor becomes stale; the harness consumes the new READY) |
 | `EXIT` | exits |
 
 Invalid commands or ranges produce `ERR`. The child is blocked on stdin while
@@ -125,8 +127,12 @@ lose its read-only protection and the test would fail.
   document why.
 * Scan tests need a module-resident signature (`MODULE_SIGNATURE`), a heap-only
   signature that `find_pattern` must not return, wildcard/nibble cases,
-  alignment, result limits, and a unit test for a match spanning the scan-chunk
-  boundary.
+  alignment, result limits, a unit test for a match spanning the scan-chunk
+  boundary, and an end-to-end match spanning the adjacent `ADJACENT` mappings.
+* Short-transfer tests use the `BOUNDARY` target: a read across the boundary
+  must report `PartialRead` with the readable prefix, a C string read must
+  return that prefix, and a dead process must abort a scan instead of returning
+  no hits.
 * Pointer tests must honor `PointerWidth` (write `u32` or `u64` accordingly),
   check empty chains, and cover width-specific overflow. String tests cover
   truncation, lossy decoding, unpaired surrogates, and multi-chunk reads.
