@@ -53,6 +53,27 @@ fn find_pattern_enumerates_all_modules() {
         MODULE_SIGNATURE
     );
 
+    let module = fixture
+        .process
+        .module(&fixture_name())
+        .expect("module lookup")
+        .expect("fixture module");
+    assert_eq!(
+        fixture
+            .process
+            .find_pattern_in_module_of(&module, &pattern)
+            .expect("scan module snapshot"),
+        Some(in_module),
+        "the named and snapshot module scans must agree"
+    );
+    assert!(
+        fixture
+            .process
+            .find_patterns_in_module_of(&module, &pattern, &ScanOptions::default())
+            .expect("scan module snapshot for all hits")
+            .contains(&in_module)
+    );
+
     let error = fixture
         .process
         .find_pattern_in_module("memdiver-not-loaded", &pattern)
@@ -245,6 +266,17 @@ fn finds_typed_values_in_memory_and_modules() {
         .find_values_in_module(&fixture_name(), value, &options)
         .expect("single module value scan");
     assert!(!in_module.contains(&address));
+
+    let module = fixture
+        .process
+        .module(&fixture_name())
+        .expect("module lookup")
+        .expect("fixture module");
+    let in_module_of = fixture
+        .process
+        .find_values_in_module_of(&module, value, &options)
+        .expect("single module snapshot value scan");
+    assert_eq!(in_module_of, in_module);
 }
 
 #[test]

@@ -220,7 +220,7 @@ fn main() -> Result<(), memdiver::Error> {
 | `Process::module_map` / `ModuleMap` | Sorted snapshot with binary-search lookups for repeated module queries. |
 | `Process::find_pattern` | First match across every loaded module. |
 | `Process::find_patterns` | All matches across readable memory. |
-| `Process::find_pattern_in_module` / `find_patterns_in_module` / `find_patterns_in_modules` | Module-scoped scans. |
+| `Process::find_pattern_in_module` / `find_patterns_in_module` / `find_patterns_in_modules` | Module-scoped scans; names use the platform rules. The `_of` variants take a `Module` snapshot. |
 | `Process::pointer_width` / `read_pointer` / `resolve_pointer_chain` | Pointer-width detection and chain traversal. |
 | `Process::read_c_string` / `read_c_string_lossy` / `read_utf16_string` | Bounded string reads. |
 | `Process::find_values` / `find_values_in_modules` / `find_values_in_module` | Search for typed values. |
@@ -274,6 +274,10 @@ with process, address, and range context.
 * Memory I/O uses positional `pread`/`pwrite` on `/proc/<pid>/mem`.
 * Regions are parsed from `/proc/<pid>/maps`; paths are raw bytes and may be
   non-UTF-8. A deleted suffix (`" (deleted)"`) is removed.
+* Module names are matched with the platform's process-name rules (case-sensitive
+  on Linux, ASCII case-insensitive on Windows); a name that matches several
+  modules returns `Error::AmbiguousModuleName` with the candidates, and the
+  `_of` scan/export variants target a specific `Module` snapshot.
 * Modules are file-backed mappings with at least one executable segment. All
   segments of the same `(device, inode)` are merged; distinct files that share a
   path (for example a deleted mapping and its replacement) are separate modules.

@@ -40,27 +40,46 @@ impl Process {
 
     /// Finds the first occurrence of `pattern` in one named module.
     ///
-    /// The module name is matched exactly. Unreadable regions and failed chunk
-    /// reads are skipped.
+    /// The module name is matched with the platform's process-name rules and
+    /// must identify exactly one module. Unreadable regions and failed chunk
+    /// reads are skipped. Use [`Process::find_pattern_in_module_of`] with a
+    /// [`Module`] snapshot when several modules share a name.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ModuleNotFound`] when the module is not loaded, an error
-    /// when the region list cannot be enumerated, [`Error::Allocation`] for the
-    /// scan buffer, or the fatal scan error when the target goes away mid-scan.
+    /// Returns [`Error::ModuleNotFound`] when the module is not loaded,
+    /// [`Error::AmbiguousModuleName`] when the name matches several modules, an
+    /// error when the region list cannot be enumerated, [`Error::Allocation`]
+    /// for the scan buffer, or the fatal scan error when the target goes away
+    /// mid-scan.
     pub fn find_pattern_in_module(
         &self,
         module: &str,
         pattern: &Pattern,
     ) -> Result<Option<Address>> {
-        let module = self.module(module)?.ok_or_else(|| Error::ModuleNotFound {
-            pid: self.pid,
-            name: module.to_owned(),
-        })?;
+        let module = self.require_module(module)?;
+        self.find_pattern_in_module_of(&module, pattern)
+    }
+
+    /// Finds the first occurrence of `pattern` in a specific module snapshot.
+    ///
+    /// Unreadable regions and failed chunk reads are skipped. The snapshot can
+    /// become stale; a module that has been unloaded simply yields no hit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the region list cannot be enumerated,
+    /// [`Error::Allocation`] for the scan buffer, or the fatal scan error when
+    /// the target goes away mid-scan.
+    pub fn find_pattern_in_module_of(
+        &self,
+        module: &Module,
+        pattern: &Pattern,
+    ) -> Result<Option<Address>> {
         let regions = self.scan_regions()?;
         let mut hits = Vec::new();
         self.scan_module(
-            &module,
+            module,
             &regions,
             pattern,
             &ScanOptions::default(),
@@ -135,29 +154,49 @@ impl Process {
 
     /// Finds all occurrences of `pattern` in one named module.
     ///
-    /// The module name is matched exactly. Results are returned in ascending
-    /// address order and bounded by [`ScanOptions::max_results`].
+    /// The module name is matched with the platform's process-name rules and
+    /// must identify exactly one module. Results are returned in ascending
+    /// address order and bounded by [`ScanOptions::max_results`]. Use
+    /// [`Process::find_patterns_in_module_of`] with a [`Module`] snapshot when
+    /// several modules share a name.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ModuleNotFound`] when the module is not loaded, an error
-    /// when the region list cannot be enumerated, [`Error::Allocation`] for the
-    /// scan buffer or results, or the fatal scan error when the target goes away
-    /// mid-scan.
+    /// Returns [`Error::ModuleNotFound`] when the module is not loaded,
+    /// [`Error::AmbiguousModuleName`] when the name matches several modules, an
+    /// error when the region list cannot be enumerated, [`Error::Allocation`]
+    /// for the scan buffer or results, or the fatal scan error when the target
+    /// goes away mid-scan.
     pub fn find_patterns_in_module(
         &self,
         module: &str,
         pattern: &Pattern,
         options: &ScanOptions,
     ) -> Result<Vec<Address>> {
-        let module = self.module(module)?.ok_or_else(|| Error::ModuleNotFound {
-            pid: self.pid,
-            name: module.to_owned(),
-        })?;
+        let module = self.require_module(module)?;
+        self.find_patterns_in_module_of(&module, pattern, options)
+    }
+
+    /// Finds all occurrences of `pattern` in a specific module snapshot.
+    ///
+    /// Results are returned in ascending address order and bounded by
+    /// [`ScanOptions::max_results`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the region list cannot be enumerated,
+    /// [`Error::Allocation`] for the scan buffer or results, or the fatal scan
+    /// error when the target goes away mid-scan.
+    pub fn find_patterns_in_module_of(
+        &self,
+        module: &Module,
+        pattern: &Pattern,
+        options: &ScanOptions,
+    ) -> Result<Vec<Address>> {
         let regions = self.scan_regions()?;
         let mut hits = Vec::new();
         self.scan_module(
-            &module,
+            module,
             &regions,
             pattern,
             options,

@@ -7,7 +7,6 @@ use goblin::elf::sym::{
     STB_GLOBAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_OBJECT, STV_DEFAULT, STV_PROTECTED,
 };
 
-use crate::process_info::name_matches;
 use crate::{Address, Error, Module, Process, Result};
 
 /// A named symbol exported by a loaded module.
@@ -66,7 +65,7 @@ impl Process {
     /// [`Error::ModuleExports`]/[`Error::ModuleParse`] when the file cannot be
     /// parsed.
     pub fn module_exports(&self, module: &str) -> Result<Vec<Export>> {
-        let module = self.find_module_for_exports(module)?;
+        let module = self.require_module(module)?;
         self.module_exports_of(&module)
     }
 
@@ -110,7 +109,7 @@ impl Process {
     ///
     /// Returns the same errors as [`Process::module_exports`].
     pub fn module_export(&self, module: &str, name: &str) -> Result<Option<Address>> {
-        let module = self.find_module_for_exports(module)?;
+        let module = self.require_module(module)?;
         self.module_export_of(&module, name)
     }
 
@@ -129,31 +128,6 @@ impl Process {
             .into_iter()
             .find(|export| export.name == name)
             .map(|export| export.address))
-    }
-
-    fn find_module_for_exports(&self, name: &str) -> Result<Module> {
-        let candidates: Vec<Module> = self
-            .modules()?
-            .into_iter()
-            .filter(|module| name_matches(module.name(), name))
-            .collect();
-        unique_module(candidates, name, self.pid)
-    }
-}
-
-/// Selects the one module matching `name`, or reports ambiguity.
-fn unique_module(mut candidates: Vec<Module>, name: &str, pid: u32) -> Result<Module> {
-    match candidates.len() {
-        0 => Err(Error::ModuleNotFound {
-            pid,
-            name: name.to_owned(),
-        }),
-        1 => Ok(candidates.pop().expect("one candidate")),
-        _ => Err(Error::AmbiguousModuleName {
-            pid,
-            name: name.to_owned(),
-            candidates,
-        }),
     }
 }
 
@@ -327,6 +301,7 @@ fn pe_export_address(base: u64, rva: u64, image_end: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module::unique_module;
 
     fn test_module() -> Module {
         Module::from_raw(memdiver_sys::RawModule {

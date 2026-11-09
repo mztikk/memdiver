@@ -52,4 +52,20 @@ impl Process {
         let pattern = Pattern::from_exact_bytes(bytemuck::bytes_of(&value))?;
         self.find_patterns_in_module(module, &pattern, options)
     }
+
+    /// Finds all occurrences of a typed value in a specific module snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Process::find_values`] and
+    /// [`Process::find_patterns_in_module_of`].
+    pub fn find_values_in_module_of<T: Pod>(
+        &self,
+        module: &crate::Module,
+        value: T,
+        options: &ScanOptions,
+    ) -> Result<Vec<Address>> {
+        let pattern = Pattern::from_exact_bytes(bytemuck::bytes_of(&value))?;
+        self.find_patterns_in_module_of(module, &pattern, options)
+    }
 }

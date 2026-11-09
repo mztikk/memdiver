@@ -12,6 +12,7 @@ use memdiver_sys::{
 };
 
 use crate::error::open_error;
+use crate::module::unique_module;
 use crate::process_info::name_matches;
 use crate::{
     Address, Error, Module, ModuleMap, ProcessInfo, Protection, Region, RegionMap, Result,
@@ -801,20 +802,33 @@ impl Process {
         Ok(self.module_map()?.find(address).cloned())
     }
 
-    /// Finds a module by exact name.
+    /// Finds a module by name.
     ///
-    /// Names are compared exactly, including case. Use the iterator returned by
-    /// [`Process::modules`] with a custom comparison when case-insensitive
-    /// matching is required (for example on Windows).
+    /// Names are matched with the platform's process-name rules (case-sensitive
+    /// on Linux, ASCII case-insensitive on Windows). Returns
+    /// [`Error::AmbiguousModuleName`] with the candidates when several loaded
+    /// modules share the name; use [`Process::modules`] or
+    /// [`Process::module_map`] to inspect and select one.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Process::modules`].
+    /// Returns the same errors as [`Process::modules`], plus
+    /// [`Error::AmbiguousModuleName`] when the name matches several modules.
     pub fn module(&self, name: &str) -> Result<Option<Module>> {
-        Ok(self
+        let candidates = self
             .modules()?
             .into_iter()
-            .find(|module| module.name() == name))
+            .filter(|module| name_matches(module.name(), name))
+            .collect();
+        unique_module(candidates, name, self.pid)
+    }
+
+    /// Returns the unique module matching `name` or [`Error::ModuleNotFound`].
+    pub(crate) fn require_module(&self, name: &str) -> Result<Module> {
+        self.module(name)?.ok_or_else(|| Error::ModuleNotFound {
+            pid: self.pid,
+            name: name.to_owned(),
+        })
     }
 
     /// Changes the protection of `len` bytes starting at `address`, returning

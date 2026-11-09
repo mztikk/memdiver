@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use memdiver_sys::RawModule;
 
-use crate::Address;
+use crate::{Address, Error, Result};
 
 /// An executable module loaded by the target process.
 ///
@@ -139,6 +139,26 @@ impl ModuleMap {
     }
 }
 
+/// Selects the one module matching `name`, or reports ambiguity.
+///
+/// `None` means no module matched; `Some` contains the unique match. The caller
+/// supplies `pid` for error context.
+pub(crate) fn unique_module(
+    mut candidates: Vec<Module>,
+    name: &str,
+    pid: u32,
+) -> Result<Option<Module>> {
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        _ => Err(Error::AmbiguousModuleName {
+            pid,
+            name: name.to_owned(),
+            candidates,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +195,34 @@ mod tests {
         );
         assert!(map.find(Address::new(0x5000)).is_none());
         assert_eq!(map.modules().len(), 1);
+    }
+
+    #[test]
+    fn unique_module_reports_ambiguity() {
+        let candidates = vec![module(), module()];
+        let error = unique_module(candidates, "example.so", 42).expect_err("two matches");
+        match error {
+            Error::AmbiguousModuleName {
+                pid,
+                name,
+                candidates,
+            } => {
+                assert_eq!(pid, 42);
+                assert_eq!(name, "example.so");
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            unique_module(Vec::new(), "missing", 42)
+                .expect("no match")
+                .is_none()
+        );
+        assert!(
+            unique_module(vec![module()], "example.so", 42)
+                .expect("one match")
+                .is_some()
+        );
     }
 
     #[test]

@@ -33,6 +33,8 @@ version is bumped for backwards-incompatible changes.
 - `Process::start_time`, `ProcessInfo::start_time` and `ProcessHandle::start_time`
   expose the opaque process-instance identity captured at open/enumeration time.
 - `Module::mappings` exposes a module's exact half-open mapping ranges.
+- `Process::find_pattern_in_module_of`, `find_patterns_in_module_of` and
+  `find_values_in_module_of` scan one `Module` snapshot unambiguously.
 - `Process::open_by_name` now compares that identity with the opened handle, so
   a PID reused by a same-named process is rejected instead of silently attached
   to. A candidate whose identity or image name cannot be read is not verified.
@@ -64,6 +66,10 @@ version is bumped for backwards-incompatible changes.
 - `Module::contains` and module-scoped scans now use a module's exact mappings
   instead of its address span, so readable memory in an unmapped gap (or another
   module mapped inside the span) is no longer treated as part of the module.
+- Module-name resolution is shared by `Process::module`, module-scoped scans and
+  exports. Names use the platform's process-name rules, and a name that matches
+  several modules now returns `Error::AmbiguousModuleName` instead of silently
+  selecting the first one.
 
 ## [0.2.0] - 2026-11-08
 
