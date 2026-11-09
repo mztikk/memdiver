@@ -232,7 +232,9 @@ in `memdiver-sys`.
   not a failed enumeration. Match names ASCII case-insensitively.
 * Pointer width comes from `IsWow64Process2` (machine pair, so 32-bit ARM on
   ARM64 is recognized), with `IsWow64Process` plus host width as the fallback
-  on older systems.
+  when the call fails. `IsWow64Process2` is a static kernel32 import, so the
+  binary requires Windows 10 1709+; the fallback is not a loader-compatibility
+  mechanism for older systems.
 * `wait_for_exit` uses `WaitForSingleObject` with millisecond timeouts; extremely
   long durations are capped by the Win32 range.
 * `enable_debug_privilege` opens the current process token, looks up

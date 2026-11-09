@@ -177,8 +177,11 @@ impl ProcessHandle {
     ///
     /// A 32-bit process (including x86-on-x64 and ARM32-on-ARM64) is reported
     /// as [`PointerWidth::Bits32`]; 64-bit targets are [`PointerWidth::Bits64`].
-    /// `IsWow64Process2` supplies the machine pair, with `IsWow64Process` as
-    /// the fallback on older systems.
+    /// `IsWow64Process2` supplies the machine pair, with `IsWow64Process` as a
+    /// fallback when the call fails. `IsWow64Process2` is a static kernel32
+    /// import, so the binary requires a Windows version that exports it
+    /// (Windows 10 1709 or newer); the fallback is not a loader-compatibility
+    /// mechanism for older systems.
     ///
     /// # Errors
     ///
@@ -199,7 +202,9 @@ impl ProcessHandle {
             return Ok(pointer_width_from_machines(process_machine, native_machine));
         }
 
-        // Fall back for older systems where IsWow64Process2 is unavailable.
+        // Fall back when IsWow64Process2 fails. This is not a compatibility
+        // path for systems that lack the export: the import is static, so the
+        // binary would not load there.
         let mut wow64 = 0i32;
         // SAFETY: the handle is owned by `self` and `wow64` is writable.
         let succeeded = unsafe { IsWow64Process(self.handle.as_handle(), &mut wow64) };

@@ -362,7 +362,10 @@ cat /proc/sys/kernel/yama/ptrace_scope
 * Process enumeration uses a Tool Help process snapshot; image paths, creation
   times and metadata are queried with limited-rights handles. Names match ASCII
   case-insensitively.
-* Pointer width uses `IsWow64Process2`, falling back to `IsWow64Process` on older systems.
+* Pointer width uses `IsWow64Process2` and falls back to `IsWow64Process` when
+  the call fails. `IsWow64Process2` is a static `kernel32` import, so the
+  library requires Windows 10 1709 or newer to load; older Windows cannot run
+  the binary.
 * Pattern scans skip unreadable and guard regions and skip failed chunk reads.
   A transfer that fails after the target exits is classified as a process exit,
   so a scan racing the exit aborts instead of returning a partial result.
