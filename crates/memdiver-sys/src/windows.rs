@@ -16,10 +16,11 @@ use std::ptr;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_INVALID_ADDRESS, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
-    ERROR_NOT_ALL_ASSIGNED, ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, FILETIME, GetLastError, HANDLE,
-    HMODULE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_FILE_NOT_FOUND,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_ADDRESS, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, ERROR_NOT_FOUND,
+    ERROR_PARTIAL_COPY, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE, HMODULE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
@@ -691,12 +692,18 @@ impl ProcessHandle {
                     self.ensure_alive()?;
                     return Ok(modules);
                 }
-                Err(error)
-                    if is_retryable_module_error(&error) && attempt + 1 < MAX_MODULE_ATTEMPTS =>
-                {
-                    attempt += 1;
+                Err(error) => {
+                    // A retryable per-module error can also mean the process
+                    // exited; check the pinned handle before treating it as a
+                    // module-unload race. This turns a dead target into
+                    // ProcessExited instead of a misleading NotFound/Other.
+                    self.ensure_alive()?;
+                    if is_retryable_module_error(&error) && attempt + 1 < MAX_MODULE_ATTEMPTS {
+                        attempt += 1;
+                    } else {
+                        return Err(error);
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -1424,7 +1431,7 @@ fn win_error(code: u32) -> Error {
         ERROR_ACCESS_DENIED => ErrorKind::PermissionDenied,
         ERROR_INVALID_HANDLE => ErrorKind::ProcessExited,
         ERROR_INVALID_ADDRESS | ERROR_PARTIAL_COPY => ErrorKind::InvalidAddress,
-        ERROR_NOT_FOUND => ErrorKind::NotFound,
+        ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => ErrorKind::NotFound,
         _ => ErrorKind::Other,
     };
     win_error_with_kind(code, kind)
@@ -1501,6 +1508,14 @@ mod tests {
             u32::MAX - 1
         );
         assert_eq!(timeout_millis(Some(Duration::MAX)), u32::MAX - 1);
+    }
+
+    #[test]
+    fn classifies_missing_files_as_not_found() {
+        for code in [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND] {
+            assert_eq!(win_error(code).kind(), ErrorKind::NotFound);
+            assert_eq!(win_error(code).raw_code(), Some(code as i32));
+        }
     }
 
     #[test]

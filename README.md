@@ -357,7 +357,8 @@ cat /proc/sys/kernel/yama/ptrace_scope
   module; other mapped sections have no path.
 * Modules come from `EnumProcessModulesEx` through the pinned handle, with
   `GetModuleInformation` and `GetModuleFileNameExW` for metadata. Enumeration is
-  retried when the module list changes during a snapshot.
+  retried when the module list changes during a snapshot; a retryable error
+  after the target exits is reported as a process exit.
 * Process enumeration uses a Tool Help process snapshot; image paths, creation
   times and metadata are queried with limited-rights handles. Names match ASCII
   case-insensitively.

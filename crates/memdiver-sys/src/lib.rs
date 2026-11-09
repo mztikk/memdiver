@@ -290,9 +290,10 @@ pub struct RestoreFailure {
 /// The step of a scoped code write that failed.
 ///
 /// A [`CodeWriteFailure::Protect`] failure names the page whose protection
-/// could not be changed; a [`CodeWriteFailure::Write`] failure covers the whole
-/// requested range. The underlying [`Error`] is boxed so this composite type
-/// stays small.
+/// could not be changed; for a preflight failure (the range is not fully
+/// committed) it names the first offending byte and the remaining range
+/// instead. A [`CodeWriteFailure::Write`] failure covers the whole requested
+/// range. The underlying [`Error`] is boxed so this composite type stays small.
 #[derive(Debug)]
 pub enum CodeWriteFailure {
     /// Changing the protection of one page failed.
