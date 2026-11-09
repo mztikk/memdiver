@@ -121,6 +121,15 @@ impl ProcessHandle {
         self.pid
     }
 
+    /// Returns the opaque process-instance identity captured at open time.
+    ///
+    /// This is the start time from `/proc/<pid>/stat`. It is stable for the
+    /// lifetime of the process instance and changes when the PID is reused.
+    #[must_use]
+    pub fn start_time(&self) -> u64 {
+        self.start_time
+    }
+
     /// Returns the pointer width of the target process, derived from the ELF
     /// class of its executable.
     ///
@@ -505,6 +514,9 @@ pub fn processes() -> Result<Vec<RawProcessInfo>, Error> {
 
 fn process_info(pid: u32) -> Option<RawProcessInfo> {
     let dir = File::open(format!("/proc/{pid}")).ok()?;
+    // Read the identity before the name so a process that is replaced during
+    // enumeration does not pair the old name with the new instance's start time.
+    let start_time = read_stat(&dir, pid).ok().map(|stat| stat.start_time);
     let exe_path = read_link_at(&dir, EXE).ok().map(strip_deleted);
     let exe_name = exe_path
         .as_deref()
@@ -520,6 +532,7 @@ fn process_info(pid: u32) -> Option<RawProcessInfo> {
         pid,
         name,
         exe_path,
+        start_time,
     })
 }
 
@@ -1479,6 +1492,13 @@ mod tests {
             ErrorKind::ProcessExited
         );
         assert!(bogus.regions().is_err());
+    }
+
+    #[test]
+    fn process_info_reports_identity() {
+        let info = process_info(std::process::id()).expect("self is listed");
+        assert_eq!(info.pid, std::process::id());
+        assert!(info.start_time.is_some(), "self must expose its start time");
     }
 
     #[test]

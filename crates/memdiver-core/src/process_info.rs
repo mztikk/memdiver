@@ -10,6 +10,7 @@ pub struct ProcessInfo {
     pid: u32,
     name: String,
     exe_path: Option<PathBuf>,
+    start_time: Option<u64>,
 }
 
 impl ProcessInfo {
@@ -18,6 +19,7 @@ impl ProcessInfo {
             pid: raw.pid,
             name: raw.name,
             exe_path: raw.exe_path,
+            start_time: raw.start_time,
         }
     }
 
@@ -43,6 +45,17 @@ impl ProcessInfo {
     #[must_use]
     pub fn exe_path(&self) -> Option<&Path> {
         self.exe_path.as_deref()
+    }
+
+    /// Returns the opaque process-instance identity captured during enumeration.
+    ///
+    /// On Linux this is the start time from `/proc/<pid>/stat`; on Windows it is
+    /// the process creation time. Compare it only with another value from the
+    /// same platform. `None` means the identity could not be read; such an entry
+    /// cannot be verified by [`Process::open_by_name`](crate::Process::open_by_name).
+    #[must_use]
+    pub fn start_time(&self) -> Option<u64> {
+        self.start_time
     }
 
     /// Returns `true` when this entry matches `name`.
@@ -81,6 +94,7 @@ mod tests {
             pid: 42,
             name: name.to_owned(),
             exe_path: path.map(PathBuf::from),
+            start_time: Some(1),
         }
     }
 
@@ -90,6 +104,7 @@ mod tests {
         assert_eq!(process.pid(), 42);
         assert_eq!(process.name(), "game.exe");
         assert_eq!(process.exe_path(), Some(Path::new("/opt/game/game.exe")));
+        assert_eq!(process.start_time(), Some(1));
     }
 
     #[test]

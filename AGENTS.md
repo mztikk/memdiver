@@ -92,10 +92,12 @@ error context, allocation decisions) to `memdiver-sys`, is an architecture bug.
     `write`, `write_code`, `write_value` (for non-empty values) and `protect`
     with `Error::ReadOnly` before any OS call. Zero-length writes remain no-ops.
 11. **Name-based opening is unambiguous.** `open_by_name` must never silently
-    pick one of several matches; return the candidate list. Verify the opened
-    image name after opening and retry a bounded number of times when the
-    matching process is replaced. An image name that cannot be read is *not* a
-    match; never return an unverified handle.
+    pick one of several matches; return the candidate list. Capture each
+    candidate's process identity during enumeration (Linux start time from
+    `/proc/<pid>/stat`, Windows creation time), verify the opened handle against
+    that identity and its image name after opening, and retry a bounded number of
+    times when the matching process is replaced. An identity or image name that
+    cannot be read is *not* a match; never return an unverified handle.
 12. **Scans are best-effort and bounded.** Pattern scans skip unreadable,
     guard, and failed-read chunks, protect against unbounded result vectors with
     `ScanOptions::max_results`, and overlap chunks so patterns spanning a chunk

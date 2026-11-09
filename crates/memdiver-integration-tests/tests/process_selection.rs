@@ -29,6 +29,10 @@ fn lists_processes_and_opens_the_current_process_by_name() {
         .find(|process| process.pid() == std::process::id())
         .expect("the current process must be listed");
     assert!(current.matches_name(&expected_name), "{current:?}");
+    assert!(
+        current.start_time().is_some(),
+        "the current process must expose its identity: {current:?}"
+    );
     assert_eq!(
         current
             .exe_path()
@@ -51,6 +55,20 @@ fn lists_processes_and_opens_the_current_process_by_name() {
     );
     let opened = Process::open_by_name(&unique_name).expect("open unique fixture by name");
     assert_eq!(opened.pid(), fixture.process.pid());
+    assert_eq!(
+        opened.start_time(),
+        fixture.process.start_time(),
+        "the opened handle must be the enumerated process instance"
+    );
+    let candidate = candidates
+        .iter()
+        .find(|process| process.pid() == fixture.process.pid())
+        .expect("enumerated fixture");
+    assert_eq!(
+        candidate.start_time(),
+        Some(opened.start_time()),
+        "the enumerated identity must match the opened handle"
+    );
     assert!(opened.is_writable());
     assert_eq!(opened.access(), ProcessAccess::ReadWrite);
     assert_eq!(
@@ -69,6 +87,11 @@ fn process_list_reports_the_fixture() {
         .find(|process| process.pid() == fixture.process.pid())
         .expect("fixture must be listed");
     assert!(fixture_info.matches_name(&expected_name));
+    assert_eq!(
+        fixture_info.start_time(),
+        Some(fixture.process.start_time()),
+        "the listed identity must match the opened handle"
+    );
     assert_eq!(
         fixture_info
             .exe_path()

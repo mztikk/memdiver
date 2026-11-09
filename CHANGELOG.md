@@ -9,6 +9,9 @@ version is bumped for backwards-incompatible changes.
 
 ### Breaking changes
 
+- `memdiver_sys::RawProcessInfo` gained a public `start_time` field. It is the
+  process identity captured during enumeration (Linux start time, Windows
+  creation time) and is used to verify name-based opens.
 - `memdiver_sys::CodeWriteFailure::Protect.source`, `CodeWriteFailure::Write`
   and `RestoreFailure.source` now carry a boxed `memdiver_sys::Error`. The
   composite error is a cold path and boxing keeps `CodeWriteError` small now
@@ -19,6 +22,11 @@ version is bumped for backwards-incompatible changes.
 
 - `memdiver_sys::Error::transferred` exposes the number of bytes a failed
   Windows transfer copied before failing.
+- `Process::start_time`, `ProcessInfo::start_time` and `ProcessHandle::start_time`
+  expose the opaque process-instance identity captured at open/enumeration time.
+- `Process::open_by_name` now compares that identity with the opened handle, so
+  a PID reused by a same-named process is rejected instead of silently attached
+  to. A candidate whose identity or image name cannot be read is not verified.
 
 ### Fixed
 
@@ -41,6 +49,9 @@ version is bumped for backwards-incompatible changes.
 - C and UTF-16 string reads return the readable prefix when a later chunk hits
   the end of a mapping, on every platform. Address-space replacement, process
   exit, range overflow and allocation failures still abort the read.
+- Windows process enumeration now derives the name from the executable path when
+  it is available, so the name and path metadata come from one process
+  instance.
 
 ## [0.2.0] - 2026-11-08
 

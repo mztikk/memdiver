@@ -365,6 +365,13 @@ pub struct RawProcessInfo {
     pub name: String,
     /// Full executable path when the operating system exposes it.
     pub exe_path: Option<PathBuf>,
+    /// Opaque process-instance identity captured during enumeration.
+    ///
+    /// On Linux this is the process start time from `/proc/<pid>/stat`; on
+    /// Windows it is the process creation time. Compare it only with another
+    /// value from the same platform. `None` means the operating system did not
+    /// report the identity (for example because the process vanished).
+    pub start_time: Option<u64>,
 }
 
 /// A loaded module as reported by the operating system.

@@ -178,9 +178,13 @@ impl Process {
 
     /// Opens the unique process matching `name` with an explicit access level.
     ///
-    /// The opened process is verified against its name after opening; a process
-    /// that exits or is replaced during the operation is retried a bounded
-    /// number of times before [`Error::ProcessChanged`] is returned.
+    /// After opening, the handle's start time (Linux) or creation time (Windows)
+    /// is compared with the identity captured during enumeration, and the image
+    /// name is verified. A process that exits, is replaced, or moves to another
+    /// PID during the operation is retried a bounded number of times before
+    /// [`Error::ProcessChanged`] is returned. A candidate whose identity or image
+    /// name could not be read is not a match; such a candidate is retried and
+    /// eventually reported as [`Error::ProcessChanged`].
     ///
     /// # Errors
     ///
@@ -209,7 +213,9 @@ impl Process {
                         }
                         Err(error) => return Err(error),
                     };
-                    if !verified_name(process.name()?.as_deref(), name) {
+                    if !verified_identity(candidate.start_time(), process.start_time())
+                        || !verified_name(process.name()?.as_deref(), name)
+                    {
                         continue;
                     }
                     return Ok(process);
@@ -237,6 +243,18 @@ impl Process {
     #[must_use]
     pub fn access(&self) -> ProcessAccess {
         self.access
+    }
+
+    /// Returns the opaque process-instance identity captured at open time.
+    ///
+    /// On Linux this is the start time from `/proc/<pid>/stat`; on Windows it is
+    /// the process creation time. It is stable for the lifetime of the process
+    /// instance, so comparing it with [`ProcessInfo::start_time`] detects a PID
+    /// reused by a different process. Compare it only with another value from the
+    /// same platform.
+    #[must_use]
+    pub fn start_time(&self) -> u64 {
+        self.inner.start_time()
     }
 
     /// Returns `true` when this handle can write to the target.
@@ -864,6 +882,12 @@ fn verified_name(actual: Option<&str>, requested: &str) -> bool {
     actual.is_some_and(|actual| name_matches(actual, requested))
 }
 
+/// Returns whether the identity captured during enumeration matches the opened
+/// handle. An identity that could not be read is not a match.
+fn verified_identity(candidate: Option<u64>, opened: u64) -> bool {
+    candidate == Some(opened)
+}
+
 fn ensure_complete_read(
     pid: u32,
     address: Address,
@@ -949,6 +973,13 @@ mod tests {
         assert!(verified_name(Some("GAME.EXE"), "game.exe"));
         #[cfg(not(windows))]
         assert!(!verified_name(Some("GAME.EXE"), "game.exe"));
+    }
+
+    #[test]
+    fn identity_must_match_exactly() {
+        assert!(verified_identity(Some(7), 7));
+        assert!(!verified_identity(Some(7), 8));
+        assert!(!verified_identity(None, 7));
     }
 
     #[test]

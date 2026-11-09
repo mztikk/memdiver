@@ -18,8 +18,8 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_ADDRESS, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
-    ERROR_NOT_ALL_ASSIGNED, ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, GetLastError, HANDLE, HMODULE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_NOT_ALL_ASSIGNED, ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, FILETIME, GetLastError, HANDLE,
+    HMODULE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
@@ -43,8 +43,8 @@ use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN, SYSTEM_INFO,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process, IsWow64Process2, OpenProcess, OpenProcessToken,
-    PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
+    GetCurrentProcess, GetProcessTimes, IsWow64Process, IsWow64Process2, OpenProcess,
+    OpenProcessToken, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
     PROCESS_VM_WRITE, QueryFullProcessImageNameW, WaitForSingleObject,
 };
@@ -73,12 +73,15 @@ const MAX_PROCESS_ATTEMPTS: u32 = 8;
 pub struct ProcessHandle {
     pid: u32,
     handle: OwnedHandle,
+    /// Creation time in 100-nanosecond intervals since 1601, captured at open.
+    creation_time: u64,
 }
 
 impl fmt::Debug for ProcessHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProcessHandle")
             .field("pid", &self.pid)
+            .field("creation_time", &self.creation_time)
             .finish_non_exhaustive()
     }
 }
@@ -132,9 +135,12 @@ impl ProcessHandle {
             return Err(win_error_with_kind(code, kind));
         }
 
+        let handle = OwnedHandle::new(handle);
+        let creation_time = process_creation_time(handle.as_handle())?;
         Ok(Self {
             pid,
-            handle: OwnedHandle::new(handle),
+            handle,
+            creation_time,
         })
     }
 
@@ -142,6 +148,16 @@ impl ProcessHandle {
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Returns the opaque process-instance identity captured at open time.
+    ///
+    /// This is the process creation time in 100-nanosecond intervals since
+    /// 1601. It is stable for the lifetime of the process instance and changes
+    /// when the PID is reused.
+    #[must_use]
+    pub fn start_time(&self) -> u64 {
+        self.creation_time
     }
 
     /// Returns the pointer width of the target process.
@@ -953,18 +969,21 @@ fn process_snapshot() -> Result<Vec<RawProcessInfo>, Error> {
     loop {
         let pid = entry.th32ProcessID;
         if pid != 0 {
-            let name = wide_to_string(&entry.szExeFile);
-            let exe_path = limited_image_path(pid, &mut path_buffer);
-            if !name.is_empty() || exe_path.is_some() {
-                let name = if name.is_empty() {
-                    exe_path.as_deref().map(file_name).unwrap_or_default()
-                } else {
-                    name
-                };
+            let metadata = limited_process_metadata(pid, &mut path_buffer);
+            // Prefer the executable path's file name so the name and path are
+            // derived from one process instance; fall back to the snapshot name.
+            let name = metadata
+                .exe_path
+                .as_deref()
+                .map(file_name)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| wide_to_string(&entry.szExeFile));
+            if !name.is_empty() || metadata.exe_path.is_some() {
                 processes.push(RawProcessInfo {
                     pid,
                     name,
-                    exe_path,
+                    exe_path: metadata.exe_path,
+                    start_time: metadata.start_time,
                 });
             }
         }
@@ -986,16 +1005,56 @@ fn process_snapshot() -> Result<Vec<RawProcessInfo>, Error> {
     Ok(processes)
 }
 
-fn limited_image_path(pid: u32, buffer: &mut [u16]) -> Option<PathBuf> {
+/// Metadata queried with a short-lived limited-rights handle during process
+/// enumeration. A failed query leaves the field `None`; it does not fail the
+/// enumeration.
+#[derive(Default)]
+struct ProcessMetadata {
+    exe_path: Option<PathBuf>,
+    start_time: Option<u64>,
+}
+
+fn limited_process_metadata(pid: u32, buffer: &mut [u16]) -> ProcessMetadata {
     // SAFETY: OpenProcess has no pointer preconditions.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
-        return None;
+        return ProcessMetadata::default();
     }
     let handle = OwnedHandle::new(handle);
-    query_image_path_with_buffer(handle.as_handle(), buffer)
-        .ok()
-        .flatten()
+    ProcessMetadata {
+        exe_path: query_image_path_with_buffer(handle.as_handle(), buffer)
+            .ok()
+            .flatten(),
+        start_time: process_creation_time(handle.as_handle()).ok(),
+    }
+}
+
+/// Returns a process's creation time in 100-nanosecond intervals since 1601.
+fn process_creation_time(handle: HANDLE) -> Result<u64, Error> {
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: the process handle is valid and all four output pointers are
+    // writable for one FILETIME value.
+    let succeeded =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    if succeeded == 0 {
+        return Err(last_error());
+    }
+    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
 }
 
 fn query_image_path(handle: HANDLE) -> Result<Option<PathBuf>, Error> {

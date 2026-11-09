@@ -55,8 +55,10 @@ does not provide yet.
   silently attach to a process that reused the PID. On Windows the kernel
   `HANDLE` is kept for every operation, including module enumeration.
 * **Process discovery without silent ambiguity.** `Process::list` enumerates
-  visible processes; `Process::open_by_name` opens only a unique match and
-  reports candidates when several processes share a name.
+  visible processes and captures each process's start time (Linux) or creation
+  time (Windows); `Process::open_by_name` opens only a unique match, verifies the
+  opened handle against that identity and the image name, and reports candidates
+  when several processes share a name.
 * **Pattern scanning built in.** Wildcard and nibble-mask patterns can be
   scanned in one module, across every module (`find_pattern`), or across all
   readable memory, with chunked reads, alignment filtering, and result limits.
@@ -276,8 +278,9 @@ with process, address, and range context.
   segments of the same `(device, inode)` are merged; distinct files that share a
   path (for example a deleted mapping and its replacement) are separate modules.
   Anonymous executable mappings are not modules.
-* Process enumeration reads `/proc`, preferring the executable file name and
-  falling back to `/proc/<pid>/comm`. Names match case-sensitively.
+* Process enumeration reads `/proc`, captures the start time from
+  `/proc/<pid>/stat`, prefers the executable file name and falls back to
+  `/proc/<pid>/comm`. Names match case-sensitively.
 * Pointer width comes from the ELF class of `/proc/<pid>/exe`.
 * Pattern and value scans read readable, non-guard regions in chunks with
   overlap. Unreadable regions and failed chunk reads are skipped; scans are
@@ -349,9 +352,9 @@ cat /proc/sys/kernel/yama/ptrace_scope
 * Modules come from `EnumProcessModulesEx` through the pinned handle, with
   `GetModuleInformation` and `GetModuleFileNameExW` for metadata. Enumeration is
   retried when the module list changes during a snapshot.
-* Process enumeration uses a Tool Help process snapshot; image paths and
-  metadata are queried with limited-rights handles where possible. Names match
-  ASCII case-insensitively.
+* Process enumeration uses a Tool Help process snapshot; image paths, creation
+  times and metadata are queried with limited-rights handles. Names match ASCII
+  case-insensitively.
 * Pointer width uses `IsWow64Process2`, falling back to `IsWow64Process` on older systems.
 * Pattern scans skip unreadable and guard regions and skip failed chunk reads.
   A transfer that fails after the target exits is classified as a process exit,
