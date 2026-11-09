@@ -322,6 +322,7 @@ mod tests {
             path: std::path::PathBuf::from("/test.so"),
             base: 0x1000,
             size: 0x1000,
+            mappings: vec![(0x1000, 0x2000)],
         })
     }
 
@@ -331,6 +332,7 @@ mod tests {
             path: std::path::PathBuf::from(format!("/{name}")),
             base,
             size: 0x1000,
+            mappings: vec![(base, base + 0x1000)],
         })
     }
 

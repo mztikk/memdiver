@@ -85,6 +85,17 @@ fn modules_include_the_fixture_executable() {
     assert!(module.size() > 0);
     assert!(module.base().get() > 0);
     assert!(module.contains(module.base()));
+    assert!(
+        !module.mappings().is_empty(),
+        "a loaded module must expose its mapping ranges"
+    );
+    for &(start, end) in module.mappings() {
+        assert!(start < end, "empty module mapping {start:#x}..{end:#x}");
+        assert!(start >= module.base().get());
+        assert!(end <= module.end().get());
+        assert!(module.contains(Address::new(start)));
+        assert!(!module.contains(Address::new(end)));
+    }
     assert!(path_name_matches(module.path(), &expected));
     assert_eq!(
         fixture

@@ -381,10 +381,16 @@ pub struct RawModule {
     pub name: String,
     /// Full path recorded by the operating system.
     pub path: PathBuf,
-    /// Load address of the module.
+    /// Load address of the module (the lowest mapping address).
     pub base: u64,
-    /// Size of the module's mapping in bytes.
+    /// Size of the module's mapping span in bytes.
     pub size: u64,
+    /// Half-open ranges of the module's own mappings, sorted and non-overlapping.
+    ///
+    /// `base`/`size` cover the span; a module can have unmapped gaps between its
+    /// mappings (notably on Linux). Containment and module-scoped scans use
+    /// these ranges. Windows reports one contiguous image range.
+    pub mappings: Vec<(u64, u64)>,
 }
 
 /// Creates the platform message for a raw OS error code.

@@ -896,11 +896,19 @@ impl ProcessHandle {
         }
         let path = PathBuf::from(wide_to_os_string(&path_buffer[..length as usize]));
 
+        let base = info.lpBaseOfDll as usize as u64;
+        let size = u64::from(info.SizeOfImage);
+        let mappings = if size == 0 {
+            Vec::new()
+        } else {
+            vec![(base, base.saturating_add(size))]
+        };
         Ok(RawModule {
             name: file_name(&path),
             path,
-            base: info.lpBaseOfDll as usize as u64,
-            size: u64::from(info.SizeOfImage),
+            base,
+            size,
+            mappings,
         })
     }
 
@@ -1579,6 +1587,7 @@ mod tests {
             path: PathBuf::from("C:\\example.dll"),
             base: 0x1000,
             size: 0x2000,
+            mappings: vec![(0x1000, 0x3000)],
         };
         assert!(module_contains(&module, 0x1000));
         assert!(module_contains(&module, 0x2fff));

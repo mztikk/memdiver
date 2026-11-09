@@ -9,6 +9,8 @@ version is bumped for backwards-incompatible changes.
 
 ### Breaking changes
 
+- `memdiver_sys::RawModule` gained a public `mappings` field with the module's
+  exact half-open mapping ranges; `base`/`size` remain the containing span.
 - `memdiver_sys::RawProcessInfo` gained a public `start_time` field. It is the
   process identity captured during enumeration (Linux start time, Windows
   creation time) and is used to verify name-based opens.
@@ -24,6 +26,7 @@ version is bumped for backwards-incompatible changes.
   Windows transfer copied before failing.
 - `Process::start_time`, `ProcessInfo::start_time` and `ProcessHandle::start_time`
   expose the opaque process-instance identity captured at open/enumeration time.
+- `Module::mappings` exposes a module's exact half-open mapping ranges.
 - `Process::open_by_name` now compares that identity with the opened handle, so
   a PID reused by a same-named process is rejected instead of silently attached
   to. A candidate whose identity or image name cannot be read is not verified.
@@ -52,6 +55,9 @@ version is bumped for backwards-incompatible changes.
 - Windows process enumeration now derives the name from the executable path when
   it is available, so the name and path metadata come from one process
   instance.
+- `Module::contains` and module-scoped scans now use a module's exact mappings
+  instead of its address span, so readable memory in an unmapped gap (or another
+  module mapped inside the span) is no longer treated as part of the module.
 
 ## [0.2.0] - 2026-11-08
 

@@ -18,6 +18,7 @@ pub struct Module {
     path: PathBuf,
     base: Address,
     size: u64,
+    mappings: Vec<(u64, u64)>,
 }
 
 impl Module {
@@ -27,6 +28,7 @@ impl Module {
             path: raw.path,
             base: Address::new(raw.base),
             size: raw.size,
+            mappings: raw.mappings,
         }
     }
 
@@ -52,10 +54,24 @@ impl Module {
         self.base
     }
 
-    /// Returns the size of the module's mapping in bytes.
+    /// Returns the size of the module's mapping span in bytes.
+    ///
+    /// The span is the distance from [`Module::base`] to the end of the
+    /// module's highest mapping. It can include unmapped gaps; use
+    /// [`Module::contains`] or [`Module::mappings`] for exact containment.
     #[must_use]
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Returns the module's own half-open mapping ranges.
+    ///
+    /// The ranges are sorted, non-overlapping and lie inside
+    /// `base()..base() + size()`. Windows reports one contiguous image range;
+    /// Linux can report several ranges for a file-backed module.
+    #[must_use]
+    pub fn mappings(&self) -> &[(u64, u64)] {
+        &self.mappings
     }
 
     /// Returns the first address after the module's mapping.
@@ -66,10 +82,14 @@ impl Module {
         Address::new(self.base.get().saturating_add(self.size))
     }
 
-    /// Returns `true` when `address` lies inside the module's mapping.
+    /// Returns `true` when `address` lies inside one of the module's mappings.
+    ///
+    /// Addresses in an unmapped gap inside the module's span are not contained.
     #[must_use]
     pub fn contains(&self, address: Address) -> bool {
-        address.get() >= self.base.get() && address.get() - self.base.get() < self.size
+        self.mappings
+            .iter()
+            .any(|&(start, end)| address.get() >= start && address.get() < end)
     }
 }
 
@@ -129,6 +149,7 @@ mod tests {
             path: PathBuf::from("/usr/lib/example.so"),
             base: 0x4000,
             size: 0x1000,
+            mappings: vec![(0x4000, 0x5000)],
         })
     }
 
@@ -140,6 +161,7 @@ mod tests {
         assert_eq!(module.base(), Address::new(0x4000));
         assert_eq!(module.size(), 0x1000);
         assert_eq!(module.end(), Address::new(0x5000));
+        assert_eq!(module.mappings(), &[(0x4000, 0x5000)]);
     }
 
     #[test]
@@ -153,6 +175,25 @@ mod tests {
         );
         assert!(map.find(Address::new(0x5000)).is_none());
         assert_eq!(map.modules().len(), 1);
+    }
+
+    #[test]
+    fn containment_skips_span_gaps() {
+        let module = Module::from_raw(RawModule {
+            name: "gapped.so".to_owned(),
+            path: PathBuf::from("/usr/lib/gapped.so"),
+            base: 0x1000,
+            size: 0x2100,
+            mappings: vec![(0x1000, 0x1100), (0x3000, 0x3100)],
+        });
+        assert!(module.contains(Address::new(0x1000)));
+        assert!(module.contains(Address::new(0x10ff)));
+        assert!(!module.contains(Address::new(0x1100)));
+        assert!(!module.contains(Address::new(0x2fff)));
+        assert!(module.contains(Address::new(0x3000)));
+        assert_eq!(module.base(), Address::new(0x1000));
+        assert_eq!(module.end(), Address::new(0x3100));
+        assert_eq!(module.size(), 0x2100);
     }
 
     #[test]

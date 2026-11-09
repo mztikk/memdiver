@@ -234,7 +234,7 @@ fn main() -> Result<(), memdiver::Error> {
 | `Export` | A named module export and its live address. |
 | `PointerWidth`, `ProcessAccess`, `ProcessInfo` | Public supporting types. |
 | `Protection` | Read / write / execute / guard flags. |
-| `Region`, `Module` | Snapshots with base, size, bounds checks, and metadata. |
+| `Region`, `Module` | Snapshots with base, size, bounds checks, mapping ranges, and metadata. |
 
 All fallible operations return `memdiver::Result<T>`, an alias for
 `Result<T, memdiver::Error>`.
@@ -277,7 +277,9 @@ with process, address, and range context.
 * Modules are file-backed mappings with at least one executable segment. All
   segments of the same `(device, inode)` are merged; distinct files that share a
   path (for example a deleted mapping and its replacement) are separate modules.
-  Anonymous executable mappings are not modules.
+  Anonymous executable mappings are not modules. A module exposes its exact
+  half-open mapping ranges, so `Module::contains` and module-scoped scans skip
+  unmapped gaps inside the module's address span.
 * Process enumeration reads `/proc`, captures the start time from
   `/proc/<pid>/stat`, prefers the executable file name and falls back to
   `/proc/<pid>/comm`. Names match case-sensitively.

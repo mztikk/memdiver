@@ -175,9 +175,10 @@ in `memdiver-sys`.
   against `/proc` whenever changing the parser.
 * A module is the union of all mappings of one file `(device, inode)` that has
   at least one executable segment. Module base is the lowest mapping address;
-  size spans all of its mappings. Distinct files with the same path (a deleted
-  mapping and its replacement) are separate modules. Do not treat every
-  `mmap`ed data file as a module.
+  size spans all of its mappings, and the exact mapping ranges are carried so
+  containment and module-scoped scans do not include gaps. Distinct files with
+  the same path (a deleted mapping and its replacement) are separate modules. Do
+  not treat every `mmap`ed data file as a module.
 * Special mappings (`[heap]`, `[stack]`, `[vdso]`, ...) have no file path and
   are `RegionKind::Private`.
 * `pread`/`pwrite` can return `EINTR`; retry. A short transfer is surfaced, not

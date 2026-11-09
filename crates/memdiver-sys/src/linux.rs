@@ -1023,6 +1023,26 @@ fn permission(actual: u8, expected: u8, flag: Protection) -> Result<Protection, 
     }
 }
 
+/// Sorts and merges adjacent or overlapping mapping ranges.
+fn merge_mappings(mut mappings: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    mappings.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(mappings.len());
+    for (start, end) in mappings {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// One module while mappings of the same file are being merged.
+struct ModuleSpan<'a> {
+    base: u64,
+    path: &'a Path,
+    mappings: Vec<(u64, u64)>,
+}
+
 fn modules_from_entries(entries: &[MapsEntry]) -> Vec<RawModule> {
     let executable_files: HashSet<FileId> = entries
         .iter()
@@ -1030,7 +1050,7 @@ fn modules_from_entries(entries: &[MapsEntry]) -> Vec<RawModule> {
         .filter_map(|entry| entry.file_id)
         .collect();
 
-    let mut spans: HashMap<FileId, (u64, u64, &Path)> = HashMap::new();
+    let mut spans: HashMap<FileId, ModuleSpan<'_>> = HashMap::new();
     for entry in entries {
         let Some(file_id) = entry.file_id else {
             continue;
@@ -1044,35 +1064,43 @@ fn modules_from_entries(entries: &[MapsEntry]) -> Vec<RawModule> {
         let end = entry.region.base.saturating_add(entry.region.size);
         match spans.entry(file_id) {
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert((entry.region.base, end, path));
+                vacant.insert(ModuleSpan {
+                    base: entry.region.base,
+                    path,
+                    mappings: vec![(entry.region.base, end)],
+                });
             }
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
                 let span = occupied.get_mut();
-                if entry.region.base < span.0 {
-                    span.0 = entry.region.base;
-                    span.2 = path;
+                if entry.region.base < span.base {
+                    span.base = entry.region.base;
+                    span.path = path;
                 }
-                span.1 = span.1.max(end);
+                span.mappings.push((entry.region.base, end));
             }
         }
     }
 
     let mut modules: Vec<RawModule> = spans
-        .into_iter()
-        .filter_map(|(_, (base, end, path))| {
+        .into_values()
+        .filter_map(|span| {
+            let mappings = merge_mappings(span.mappings);
+            let base = mappings.first()?.0;
+            let end = mappings.last()?.1;
             let size = end.checked_sub(base)?;
             if size == 0 {
                 return None;
             }
-            let name = path.file_name().map_or_else(
-                || path.to_string_lossy().into_owned(),
+            let name = span.path.file_name().map_or_else(
+                || span.path.to_string_lossy().into_owned(),
                 |name| name.to_string_lossy().into_owned(),
             );
             Some(RawModule {
                 name,
-                path: path.to_path_buf(),
+                path: span.path.to_path_buf(),
                 base,
                 size,
+                mappings,
             })
         })
         .collect();
@@ -1372,9 +1400,11 @@ mod tests {
         assert_eq!(modules[0].name, "libx.so.1");
         assert_eq!(modules[0].base, 0x1000);
         assert_eq!(modules[0].size, 0x2000);
+        assert_eq!(modules[0].mappings, vec![(0x1000, 0x3000)]);
         assert_eq!(modules[1].name, "app");
         assert_eq!(modules[1].base, 0x5000);
         assert_eq!(modules[1].size, 0x1000);
+        assert_eq!(modules[1].mappings, vec![(0x5000, 0x6000)]);
     }
 
     #[test]
@@ -1399,6 +1429,34 @@ mod tests {
         assert_eq!(modules.len(), 2);
         assert_eq!(modules[0].base, 0x1000);
         assert_eq!(modules[1].base, 0x3000);
+    }
+
+    #[test]
+    fn modules_keep_discontiguous_mappings() {
+        let entries = vec![
+            raw_entry(
+                0x1000,
+                0x100,
+                Protection::READ | Protection::EXECUTE,
+                Some("/opt/app/libfoo.so"),
+                Some(30),
+            ),
+            raw_entry(
+                0x2000,
+                0x100,
+                Protection::READ,
+                Some("/opt/app/libfoo.so"),
+                Some(30),
+            ),
+        ];
+        let modules = modules_from_entries(&entries);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].base, 0x1000);
+        assert_eq!(modules[0].size, 0x1100);
+        assert_eq!(
+            modules[0].mappings,
+            vec![(0x1000, 0x1100), (0x2000, 0x2100)]
+        );
     }
 
     #[test]

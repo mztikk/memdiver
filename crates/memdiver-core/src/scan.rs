@@ -15,7 +15,7 @@ impl Process {
     ///
     /// Modules are searched in ascending load-address order, so the result is
     /// the first hit in module order. Only readable, non-guard regions inside
-    /// module bounds are scanned; adjacent readable regions are coalesced so a
+    /// the module's own mappings are scanned; adjacent readable regions are coalesced so a
     /// pattern crossing a mapping boundary is still found. Unreadable regions
     /// and ordinary failed chunk reads are skipped, while an exited or replaced
     /// process aborts the scan.
@@ -209,29 +209,39 @@ fn scan_ranges(regions: &[crate::Region], module: Option<&Module>) -> Vec<ScanRa
         if !scan_region(region) {
             continue;
         }
-        let (start, end) = match module {
-            Some(module) => (
-                region.base().get().max(module.base().get()),
-                region.end().get().min(module.end().get()),
-            ),
-            None => (region.base().get(), region.end().get()),
-        };
-        if end <= start {
-            continue;
-        }
-        if let Some(last) = ranges.last_mut() {
-            let last_end = last.base.get().saturating_add(last.size);
-            if last_end == start {
-                last.size = last.size.saturating_add(end - start);
-                continue;
+        match module {
+            Some(module) => {
+                // Only the module's own mappings are scanned; a readable
+                // mapping in an unmapped gap of the module's span does not
+                // belong to the module.
+                for &(mapping_start, mapping_end) in module.mappings() {
+                    let start = region.base().get().max(mapping_start);
+                    let end = region.end().get().min(mapping_end);
+                    push_scan_range(&mut ranges, start, end);
+                }
             }
+            None => push_scan_range(&mut ranges, region.base().get(), region.end().get()),
         }
-        ranges.push(ScanRange {
-            base: Address::new(start),
-            size: end - start,
-        });
     }
     ranges
+}
+
+/// Appends a half-open range, merging it with the previous one when adjacent.
+fn push_scan_range(ranges: &mut Vec<ScanRange>, start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    if let Some(last) = ranges.last_mut() {
+        let last_end = last.base.get().saturating_add(last.size);
+        if last_end == start {
+            last.size = last.size.saturating_add(end - start);
+            return;
+        }
+    }
+    ranges.push(ScanRange {
+        base: Address::new(start),
+        size: end - start,
+    });
 }
 
 /// Returns `true` when a failed chunk read means the whole scan is invalid
@@ -447,6 +457,7 @@ mod tests {
             path: std::path::PathBuf::from("/test"),
             base: 0x1800,
             size: 0x1000,
+            mappings: vec![(0x1800, 0x2800)],
         });
         let regions = vec![
             test_region(0x1000, 0x1000, Protection::READ),
@@ -456,6 +467,28 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].base, Address::new(0x1800));
         assert_eq!(ranges[0].size, 0x1000);
+    }
+
+    #[test]
+    fn scan_ranges_do_not_scan_span_gaps() {
+        let module = Module::from_raw(memdiver_sys::RawModule {
+            name: "gapped".to_owned(),
+            path: std::path::PathBuf::from("/gapped"),
+            base: 0x1000,
+            size: 0x3000,
+            mappings: vec![(0x1000, 0x1100), (0x3000, 0x3100)],
+        });
+        let regions = vec![
+            test_region(0x1000, 0x100, Protection::READ),
+            test_region(0x2000, 0x100, Protection::READ),
+            test_region(0x3000, 0x100, Protection::READ),
+        ];
+        let ranges = scan_ranges(&regions, Some(&module));
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].base, Address::new(0x1000));
+        assert_eq!(ranges[0].size, 0x100);
+        assert_eq!(ranges[1].base, Address::new(0x3000));
+        assert_eq!(ranges[1].size, 0x100);
     }
 
     #[test]
