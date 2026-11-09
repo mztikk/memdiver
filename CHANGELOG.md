@@ -14,6 +14,9 @@ version is bumped for backwards-incompatible changes.
   a scan that races process exit aborts instead of returning a partial or empty
   result. `ERROR_PARTIAL_COPY` is classified as `InvalidAddress` while the
   target is still alive.
+- Linux: module files are opened through the pinned `/proc/<pid>` directory
+  descriptor instead of constructing a fresh `/proc/<pid>/root` path, so a PID
+  reused during export resolution cannot redirect the lookup.
 
 ## [0.2.0] - 2026-11-08
 

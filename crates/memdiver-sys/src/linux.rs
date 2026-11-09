@@ -15,12 +15,12 @@
 //! bytes and reads report [`ErrorKind::AddressSpaceReplaced`].
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, OsString};
+use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -349,9 +349,10 @@ impl ProcessHandle {
     /// Reads a mapped module file through the target's root and returns its
     /// bytes.
     ///
-    /// The path is the one `/proc/<pid>/maps` reported, interpreted inside the
-    /// target's mount namespace (`/proc/<pid>/root`), not the caller's. The
-    /// opened file must be a regular file no larger than
+    /// The path is the one `/proc/<pid>/maps` reported, opened relative to the
+    /// pinned `/proc/<pid>` directory descriptor (`root/...`), so it is
+    /// interpreted inside the target's mount namespace and cannot be redirected
+    /// by PID reuse. The opened file must be a regular file no larger than
     /// [`MAX_MODULE_FILE_SIZE`](crate::MAX_MODULE_FILE_SIZE), and its inode
     /// must still match the mapping (the reported device can differ under
     /// overlay/Btrfs, so the inode is the stable identity). This rejects device
@@ -389,8 +390,8 @@ impl ProcessHandle {
             ))
         })?;
 
-        let full_path = target_root_path(self.pid, path)?;
-        let file = File::open(&full_path).map_err(io_error)?;
+        let relative = target_relative_module_path(path)?;
+        let file = open_proc_file(&self.proc_dir, &relative, libc::O_RDONLY).map_err(io_error)?;
         let metadata = file.metadata().map_err(io_error)?;
         // Compare the inode rather than `(st_dev, st_ino)`: overlayfs and btrfs
         // subvolumes can report a different `st_dev` for the path than for the
@@ -1070,9 +1071,13 @@ fn modules_from_entries(entries: &[MapsEntry]) -> Vec<RawModule> {
     modules
 }
 
-/// Builds the path of a target-namespace file for opening through
-/// `/proc/<pid>/root`.
-fn target_root_path(pid: u32, path: &Path) -> Result<PathBuf, Error> {
+/// Builds the target-namespace path of a module file, relative to an open
+/// `/proc/<pid>` directory descriptor.
+///
+/// The path must be absolute and must not contain a parent-directory component;
+/// it is prefixed with `root/` so that `openat` follows the target's root link.
+/// Non-UTF-8 path bytes are preserved.
+fn target_relative_module_path(path: &Path) -> Result<CString, Error> {
     let safe = path.is_absolute()
         && !path
             .components()
@@ -1086,7 +1091,14 @@ fn target_root_path(pid: u32, path: &Path) -> Result<PathBuf, Error> {
     let relative = path
         .strip_prefix("/")
         .map_err(|_| Error::malformed(format!("module path {} is not absolute", path.display())))?;
-    Ok(PathBuf::from(format!("/proc/{pid}/root")).join(relative))
+    let mut bytes = b"root/".to_vec();
+    bytes.extend_from_slice(relative.as_os_str().as_bytes());
+    CString::new(bytes).map_err(|_| {
+        Error::malformed(format!(
+            "module path {} contains a NUL byte",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1389,13 +1401,22 @@ mod tests {
     }
 
     #[test]
-    fn builds_target_root_paths_and_rejects_escapes() {
+    fn builds_target_relative_paths_and_rejects_escapes() {
         assert_eq!(
-            target_root_path(42, Path::new("/usr/lib/libfoo.so")).expect("valid path"),
-            PathBuf::from("/proc/42/root/usr/lib/libfoo.so")
+            target_relative_module_path(Path::new("/usr/lib/libfoo.so"))
+                .expect("valid path")
+                .to_bytes(),
+            b"root/usr/lib/libfoo.so"
         );
-        assert!(target_root_path(42, Path::new("relative/libfoo.so")).is_err());
-        assert!(target_root_path(42, Path::new("/usr/../etc/passwd")).is_err());
+        assert!(target_relative_module_path(Path::new("relative/libfoo.so")).is_err());
+        assert!(target_relative_module_path(Path::new("/usr/../etc/passwd")).is_err());
+        let non_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/name-\xff"));
+        assert_eq!(
+            target_relative_module_path(non_utf8)
+                .expect("non-UTF-8 path")
+                .to_bytes(),
+            b"root/tmp/name-\xff"
+        );
     }
 
     #[test]

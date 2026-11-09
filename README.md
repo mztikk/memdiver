@@ -283,9 +283,10 @@ with process, address, and range context.
 * ELF exports are read from the module file, filtered to defined global/weak
   default/protected dynamic symbols, and rebased using the ELF type
   (`ET_DYN`: module base + symbol value; `ET_EXEC`: absolute symbol value).
-  The file is opened through `/proc/<pid>/root` (the target's mount namespace),
-  its inode must still match the mapping, and the read is bounded to a regular
-  file of at most 1 GiB. ELF dynamic symbols come from the dynamic segment;
+  The file is opened relative to the pinned `/proc/<pid>` directory descriptor
+  (`root/...`, the target's mount namespace), so a reused PID cannot redirect
+  the lookup; its inode must still match the mapping, and the read is bounded to
+  a regular file of at most 1 GiB. ELF dynamic symbols come from the dynamic segment;
   symbol-version information additionally needs the version sections.
 * `wait_for_exit` blocks in `poll` on a pidfd, so an idle wait causes no
   periodic wakeups. Kernels before 5.3, or hosts whose seccomp policy denies
