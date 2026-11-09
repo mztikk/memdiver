@@ -51,6 +51,7 @@ Then it reads one command per line and writes one response line:
 | `BOUNDARY` | `BOUNDARY <address> <page_size>`: a readable page followed by an inaccessible one |
 | `ADJACENT` | `ADJACENT <address> <page_size>`: two adjacent readable pages with different protections |
 | `EXEC` | Linux only: re-executes the fixture (the pinned descriptor becomes stale; the harness consumes the new READY) |
+| `SYM <name>` | Linux only: `SYM <hex-address>` for a `dlsym` lookup in the fixture |
 | `EXIT` | exits |
 
 Invalid commands or ranges produce `ERR`. The child is blocked on stdin while

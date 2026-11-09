@@ -337,6 +337,17 @@ impl Fixture {
         (Address::new(address), page_size)
     }
 
+    /// Resolves a symbol through the fixture's own `dlsym` scope.
+    #[cfg(target_os = "linux")]
+    pub fn symbol_address(&mut self, name: &str) -> u64 {
+        self.request(&format!("SYM {name}"));
+        let response = self.response();
+        let fields: Vec<&str> = response.split_whitespace().collect();
+        assert_eq!(fields.len(), 2, "unexpected SYM response: {response:?}");
+        assert_eq!(fields[0], "SYM");
+        u64::from_str_radix(fields[1], 16).expect("signed symbol address")
+    }
+
     /// Asks the fixture to exit without reaping it.
     ///
     /// This lets a test observe a zombie on Linux and a signaled process on

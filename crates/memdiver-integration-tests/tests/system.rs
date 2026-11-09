@@ -167,7 +167,7 @@ fn debug_privilege_helper_is_opt_in() {
 #[cfg(target_os = "linux")]
 #[test]
 fn resolves_libc_exports() {
-    let fixture = Fixture::spawn();
+    let mut fixture = Fixture::spawn();
     let modules = fixture.process.modules().expect("modules");
     let libc = modules
         .iter()
@@ -208,6 +208,21 @@ fn resolves_libc_exports() {
             .module_export_of(&module, symbol.name())
             .expect("single export from module handle"),
         Some(symbol.address())
+    );
+
+    // `timer_delete` exists in both a default (GLIBC_2.34) and a compatibility
+    // (GLIBC_2.3.3) version with different addresses. dlsym returns the default
+    // version, so the export must match it; a last-write-wins parser would pick
+    // the compatibility address.
+    let versioned = fixture
+        .process
+        .module_export(libc.name(), "timer_delete")
+        .expect("versioned export lookup")
+        .expect("timer_delete must be exported");
+    assert_eq!(
+        versioned.get(),
+        fixture.symbol_address("timer_delete"),
+        "the default symbol version must be preferred"
     );
 
     let error = fixture

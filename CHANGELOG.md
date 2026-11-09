@@ -103,7 +103,8 @@ version is bumped for backwards-incompatible changes.
   map APIs, a Windows protection round trip on the fixture's `MULTI` target, and
   concurrent code writes to one page.
 - Added a synthetic PE export table covering named, forwarded and ordinal-only
-  exports.
+  exports, and a real versioned-ELF check comparing a libc export's default
+  version address with the fixture's own `dlsym` result.
 - The harness now consumes the re-exec'd fixture's new `READY` line and removes
   a uniquely named fixture copy if construction unwinds.
 

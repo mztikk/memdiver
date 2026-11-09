@@ -21,6 +21,7 @@
 //!   pages with different protections, used for scan-coalescing tests
 //! * `EXEC` (Linux only) — replaces the fixture image with itself; the parent's
 //!   pinned memory descriptor becomes stale
+//! * `SYM <name>` (Linux only) → `SYM <hex-address>` for a `dlsym` lookup
 //! * `EXIT` → the fixture exits
 //!
 //! Invalid commands or ranges produce `ERR`.
@@ -389,6 +390,22 @@ fn main() -> io::Result<()> {
             )?,
             #[cfg(target_os = "linux")]
             Some("ZERO") => writeln!(output, "ZERO {zero_address}")?,
+            #[cfg(target_os = "linux")]
+            Some("SYM") => {
+                let resolved = fields
+                    .next()
+                    .and_then(|name| std::ffi::CString::new(name).ok())
+                    .and_then(|name| {
+                        // SAFETY: `name` is a valid NUL-terminated symbol name
+                        // and RTLD_DEFAULT asks for the global scope.
+                        let pointer = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+                        (!pointer.is_null()).then_some(pointer as usize)
+                    });
+                match resolved {
+                    Some(address) => writeln!(output, "SYM {address:x}")?,
+                    None => writeln!(output, "ERR")?,
+                }
+            }
             Some("BOUNDARY") => writeln!(
                 output,
                 "BOUNDARY {} {}",
