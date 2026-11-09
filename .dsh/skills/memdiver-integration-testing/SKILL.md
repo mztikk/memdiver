@@ -47,6 +47,8 @@ Then it reads one command per line and writes one response line:
 | `PEEK <offset> <length>` | lowercase hex bytes |
 | `CODE` | `CODE <address> <length>` for the executable code target |
 | `MULTI` | Windows only: `MULTI <address> <length> <page_size>` for the two-page target |
+| `ZERO` | Linux only: `ZERO <address>` for the executable `/dev/zero` mapping |
+| `EXEC` | Linux only: re-executes the fixture (the pinned descriptor becomes stale) |
 | `EXIT` | exits |
 
 Invalid commands or ranges produce `ERR`. The child is blocked on stdin while
@@ -94,8 +96,14 @@ lose its read-only protection and the test would fail.
   byte ranges. Wrap a separately opened `Process` in `Arc` to share it; the
   fixture keeps its own handle.
 * Process-name tests must not assume the fixture name is unique: other tests
-  spawn fixtures concurrently. Use the test executable's unique name for a
-  successful `open_by_name` test, and two fixtures for an ambiguity test.
+  spawn fixtures concurrently. Use `Fixture::spawn_unique()` for a successful
+  `open_by_name` test (a uniquely named copy of the fixture; the test
+  executable's own name is not unique), and two fixtures for an ambiguity test.
+  Assert that the enumerated `ProcessInfo::start_time` and the opened
+  `Process::start_time` agree.
+* Module tests should assert that every `Module::mappings` range lies inside
+  `base..end`, that `contains` is true at each range start and false at its end,
+  and that the `*_of` scan variants agree with the named variants.
 * Read-only tests must read successfully and assert `Error::ReadOnly` for
   `write`, `write_code`, `write_value`, and `protect`. Zero-length writes,
   including `write_code`, remain no-ops.

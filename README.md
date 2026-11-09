@@ -11,8 +11,9 @@ of another process on Linux and Windows.
 It is built around a small set of guarantees that matter in real deployments:
 a handle pins the process it was opened for, transfers are never silently
 truncated, every OS failure keeps its platform error code and context, typed
-access is restricted to plain-old-data, and every operation is covered by unit
-or real cross-process integration tests.
+access is restricted to plain-old-data, and every public operation has unit or
+real cross-process integration coverage (some platform paths are only exercised
+in CI).
 
 ## Features
 
@@ -208,7 +209,7 @@ fn main() -> Result<(), memdiver::Error> {
 | `Process::list()` | Enumerate visible processes as `ProcessInfo`. |
 | `Process::find_by_name(name)` | Find all matching processes. |
 | `Process::open_by_name(name)` | Open the unique match, or return an ambiguity error. |
-| `Process::pid()` / `name()` / `exe_path()` | Identity of the pinned process. |
+| `Process::pid()` / `start_time()` / `name()` / `exe_path()` | Identity of the pinned process (`start_time` is the Linux start time or Windows creation time). |
 | `Process::is_alive()` | Liveness, zombie-aware on Linux. |
 | `Process::read` / `write` | Byte-slice transfers. |
 | `Process::write_code` | Reversible code write with temporary/page-by-page protection restore. |
@@ -234,7 +235,7 @@ fn main() -> Result<(), memdiver::Error> {
 | `Export` | A named module export and its live address. |
 | `PointerWidth`, `ProcessAccess`, `ProcessInfo` | Public supporting types. |
 | `Protection` | Read / write / execute / guard flags. |
-| `Region`, `Module` | Snapshots with base, size, bounds checks, mapping ranges, and metadata. |
+| `Region`, `Module` | Snapshots with base, size, bounds checks, exact `Module::mappings`, and metadata. |
 
 All fallible operations return `memdiver::Result<T>`, an alias for
 `Result<T, memdiver::Error>`.
@@ -479,7 +480,7 @@ read-only handles, regions, modules, pattern and typed-value scanning (including
 a signature embedded in the fixture's executable), pointer chains, bounded
 strings, batched transfers, scoped code writes, waiting for exit, module exports
 against libc/ntdll, protection changes (Windows), the opt-in privilege helper,
-liveness, PID-reuse safety, errors, and concurrent access.
+liveness, process-identity verification, errors, and concurrent access.
 
 Windows behaviour is type-checked and linted on Linux via the
 `x86_64-pc-windows-gnu` target and fully executed on Windows in CI. See

@@ -17,6 +17,7 @@ Both `src/linux.rs` and `src/windows.rs` expose the same `ProcessHandle` API
 open(pid) -> Result<Self>
 open_with(pid, writable: bool) -> Result<Self>
 pid() -> u32
+start_time() -> u64
 exe_path() -> Result<Option<PathBuf>>
 pointer_width() -> Result<PointerWidth>
 read(address: u64, &mut [u8]) -> Result<usize>
@@ -25,7 +26,9 @@ write_code(address: u64, &[u8]) -> Result<usize, CodeWriteError>
 is_alive() -> bool
 wait_for_exit(timeout: Option<Duration>) -> Result<bool>
 regions() -> Result<Vec<RawRegion>>
+regions_without_paths() -> Result<Vec<RawRegion>>
 modules() -> Result<Vec<RawModule>>
+read_module_file(base: u64, path: &Path) -> Result<Vec<u8>>
 protect(address, len, Protection) -> Result<Protection>
 processes() -> Result<Vec<RawProcessInfo>>
 enable_debug_privilege() -> Result<()>
@@ -37,6 +40,10 @@ the OS and parses it with `goblin`. Do not move file-format parsing into
 
 The safe layer owns name matching, ambiguity handling, scan scoping, pointer
 chains, and string framing; the sys layer returns raw facts only.
+`RawProcessInfo.start_time`/`ProcessHandle::start_time` carry the opaque
+identity used to verify name-based opens, and `RawModule.mappings` carries the
+module's exact half-open mapping ranges (the `base`/`size` span may include
+gaps).
 
 Reads and writes return the actual transfer count; the safe layer decides that
 a short transfer is `PartialRead`/`PartialWrite`. Never hide a short transfer
@@ -113,9 +120,11 @@ The pinned-instance invariants are not negotiable:
 * `pread`/`pwrite` can return `EINTR`; retry. Use `pread64`/`pwrite64` and
   reject ranges above `i64::MAX`.
 * Modules are file-backed mappings with an executable segment; merge all
-  segments of the same file. Anonymous executable mappings are not modules.
-* Process enumeration reads `/proc`, prefers the executable basename, falls back
-  to `comm`, skips vanished processes, and sorts by PID. Name matching is
+  segments of the same file and keep the exact mapping ranges. Anonymous
+  executable mappings are not modules.
+* Process enumeration reads `/proc`, captures the start time from
+  `/proc/<pid>/stat`, prefers the executable basename, falls back to `comm`,
+  skips vanished processes, and sorts by PID. Name matching is
   case-sensitive.
 * Pointer width comes from the ELF class byte of `/proc/<pid>/exe`.
 * `wait_for_exit` prefers a verified pidfd and blocks in `poll`; fall back to
@@ -171,7 +180,8 @@ The pinned-instance invariants are not negotiable:
   the host pointer width. Core pointer-chain arithmetic must respect the
   target width.
 * `ReadProcessMemory`/`WriteProcessMemory` may copy partial data and still
-  return failure. Report the error; never infer success from bytes copied.
+  return failure. Report the error and expose the copied count through
+  `Error::transferred`; never infer success from bytes copied.
 
 ## Unsafe review checklist
 

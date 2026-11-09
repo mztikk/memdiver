@@ -112,9 +112,10 @@ edge-case behaviours. It also fixes the findings of the 0.1.1 code review.
   modules. Use the new `module_exports_of`/`module_export_of` methods with a
   `Module` snapshot to target one module unambiguously.
 - `Process::open_by_name` no longer returns a handle when the opened process's
-  image name cannot be read. An unreadable name is treated as unverified and the
-  bounded retry ends in `Error::ProcessChanged`. On Windows, executable-path
-  query failures are now errors instead of a silent `None`.
+  image name cannot be read. An unavailable image name (`Ok(None)`) is treated
+  as unverified and the bounded retry ends in `Error::ProcessChanged`. On
+  Windows, executable-path query failures are errors instead of a silent
+  `None`.
 - On Linux, a target `execve` keeps the PID and start time but replaces the
   address space. The pinned memory descriptor then returns zero bytes; reads,
   writes and scans report the new `Error::AddressSpaceReplaced` instead of a
