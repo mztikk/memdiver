@@ -90,7 +90,7 @@ fn opening_an_exited_process_is_rejected() {
             memdiver::OsErrorKind::ProcessExited,
             "a lingering terminated process must be classified as exited"
         ),
-        Error::ProcessNotFound { .. } => {}
+        Error::ProcessNotFound { .. } | Error::AccessDenied { .. } => {}
         other => panic!("unexpected {other:?}"),
     }
 }

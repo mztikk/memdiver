@@ -708,17 +708,23 @@ impl Process {
     /// [`Process::regions`] call would also enumerate every module.
     pub(crate) fn scan_regions(&self) -> Result<Vec<Region>> {
         // Sorted by base, like `regions`; scan_ranges relies on that order.
-        Ok(self
+        let raw = self
             .inner
             .regions_without_paths()
             .map_err(|source| Error::Enumerate {
                 pid: self.pid,
                 what: "memory regions",
                 source,
-            })?
-            .into_iter()
-            .map(Region::from_raw)
-            .collect())
+            })?;
+        let mut regions = Vec::new();
+        regions
+            .try_reserve(raw.len())
+            .map_err(|source| Error::Allocation {
+                len: raw.len().saturating_mul(size_of::<Region>()),
+                source,
+            })?;
+        regions.extend(raw.into_iter().map(Region::from_raw));
+        Ok(regions)
     }
 
     /// Finds the committed region containing `address`.
