@@ -45,11 +45,15 @@ impl Process {
     /// Returns [`Error::ReadOnly`] when the handle is read-only and at least one
     /// entry is non-empty, or [`Error::BatchWrite`] when an entry fails.
     pub fn write_many(&self, writes: &[(Address, &[u8])]) -> Result<()> {
-        if !self.is_writable() && writes.iter().any(|(_, data)| !data.is_empty()) {
-            return Err(Error::ReadOnly {
-                pid: self.pid,
-                operation: "Process::write_many",
-            });
+        if !self.is_writable() {
+            if let Some((address, data)) = writes.iter().find(|(_, data)| !data.is_empty()) {
+                return Err(Error::ReadOnly {
+                    pid: self.pid,
+                    operation: "Process::write_many",
+                    address: *address,
+                    len: data.len(),
+                });
+            }
         }
         for (index, (address, data)) in writes.iter().enumerate() {
             self.write(*address, data)

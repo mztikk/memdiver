@@ -9,6 +9,12 @@ version is bumped for backwards-incompatible changes.
 
 ### Breaking changes
 
+- `memdiver_core::Error` gained context: `AddressSpaceReplaced` now keeps its
+  `OsError` source, `ReadOnly` carries the rejected address/length,
+  `InvalidLength` carries the PID and address, and `ModuleFile`/`ModuleExports`/
+  `ModuleParse`/`ModuleNotFound`/`AmbiguousModuleName` name the PID (and module
+  file path where known). Patterns that name every field need the new fields;
+  use `..` for forward compatibility.
 - `memdiver_sys::RawModule` gained a public `mappings` field with the module's
   exact half-open mapping ranges; `base`/`size` remain the containing span.
 - `memdiver_sys::RawProcessInfo` gained a public `start_time` field. It is the

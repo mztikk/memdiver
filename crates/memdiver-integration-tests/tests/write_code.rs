@@ -58,7 +58,7 @@ fn read_only_handles_reject_non_empty_code_writes() {
         .write_code(fixture.address, b"nope")
         .expect_err("read-only code write must fail");
     match error {
-        Error::ReadOnly { pid, operation } => {
+        Error::ReadOnly { pid, operation, .. } => {
             assert_eq!(pid, fixture.process.pid());
             assert_eq!(operation, "Process::write_code");
         }

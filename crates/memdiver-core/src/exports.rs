@@ -89,11 +89,12 @@ impl Process {
             .inner
             .read_module_file(module.base().get(), path)
             .map_err(|source| Error::ModuleFile {
+                pid: self.pid,
                 module: module.name().to_owned(),
                 path: path.to_path_buf(),
                 source,
             })?;
-        parse_exports(module, &bytes)
+        parse_exports(self.pid, module, &bytes)
     }
 
     /// Looks up one named export of a loaded module.
@@ -136,48 +137,57 @@ impl Process {
             .into_iter()
             .filter(|module| name_matches(module.name(), name))
             .collect();
-        unique_module(candidates, name)
+        unique_module(candidates, name, self.pid)
     }
 }
 
 /// Selects the one module matching `name`, or reports ambiguity.
-fn unique_module(mut candidates: Vec<Module>, name: &str) -> Result<Module> {
+fn unique_module(mut candidates: Vec<Module>, name: &str, pid: u32) -> Result<Module> {
     match candidates.len() {
         0 => Err(Error::ModuleNotFound {
+            pid,
             name: name.to_owned(),
         }),
         1 => Ok(candidates.pop().expect("one candidate")),
         _ => Err(Error::AmbiguousModuleName {
+            pid,
             name: name.to_owned(),
             candidates,
         }),
     }
 }
 
-fn parse_exports(module: &Module, bytes: &[u8]) -> Result<Vec<Export>> {
+fn parse_exports(pid: u32, module: &Module, bytes: &[u8]) -> Result<Vec<Export>> {
     if bytes.starts_with(b"\x7fELF") {
-        let elf = goblin::elf::Elf::parse(bytes).map_err(|error| parse_error(module, error))?;
-        elf_exports(module, &elf)
+        let elf =
+            goblin::elf::Elf::parse(bytes).map_err(|error| parse_error(pid, module, error))?;
+        elf_exports(pid, module, &elf)
     } else if bytes.starts_with(b"MZ") {
-        let pe = goblin::pe::PE::parse(bytes).map_err(|error| parse_error(module, error))?;
+        let pe = goblin::pe::PE::parse(bytes).map_err(|error| parse_error(pid, module, error))?;
         if pe_has_export_directory(&pe) && pe.export_data.is_none() {
             return Err(Error::ModuleExports {
+                pid,
                 module: module.name().to_owned(),
+                path: module.path().to_path_buf(),
                 reason: "the PE export directory is present but could not be parsed".to_owned(),
             });
         }
-        pe_exports(module, &pe)
+        pe_exports(pid, module, &pe)
     } else {
         Err(Error::ModuleExports {
+            pid,
             module: module.name().to_owned(),
+            path: module.path().to_path_buf(),
             reason: "module file is neither ELF nor PE".to_owned(),
         })
     }
 }
 
-fn parse_error(module: &Module, error: goblin::error::Error) -> Error {
+fn parse_error(pid: u32, module: &Module, error: goblin::error::Error) -> Error {
     Error::ModuleParse {
+        pid,
         module: module.name().to_owned(),
+        path: module.path().to_path_buf(),
         reason: error.to_string(),
         source: Box::new(error),
     }
@@ -217,12 +227,14 @@ fn insert_default_export(
     }
 }
 
-fn elf_exports(module: &Module, elf: &goblin::elf::Elf<'_>) -> Result<Vec<Export>> {
+fn elf_exports(pid: u32, module: &Module, elf: &goblin::elf::Elf<'_>) -> Result<Vec<Export>> {
     let base = module.base().get();
     let image_end = module.end().get();
     if elf.header.e_type != ET_DYN && elf.header.e_type != ET_EXEC {
         return Err(Error::ModuleExports {
+            pid,
             module: module.name().to_owned(),
+            path: module.path().to_path_buf(),
             reason: format!(
                 "ELF type {} is not a loaded executable or shared object",
                 elf.header.e_type
@@ -272,7 +284,7 @@ fn elf_exports(module: &Module, elf: &goblin::elf::Elf<'_>) -> Result<Vec<Export
         .collect())
 }
 
-fn pe_exports(module: &Module, pe: &goblin::pe::PE<'_>) -> Result<Vec<Export>> {
+fn pe_exports(_pid: u32, module: &Module, pe: &goblin::pe::PE<'_>) -> Result<Vec<Export>> {
     let base = module.base().get();
     let image_end = module.end().get();
     let mut exports = BTreeMap::new();
@@ -342,9 +354,11 @@ mod tests {
             raw_module("libfoo.so", 0x1000),
             raw_module("libfoo.so", 0x2000),
         ];
-        let error = unique_module(candidates, "libfoo.so").expect_err("duplicate names");
+        let error = unique_module(candidates, "libfoo.so", 42).expect_err("duplicate names");
         match error {
-            Error::AmbiguousModuleName { name, candidates } => {
+            Error::AmbiguousModuleName {
+                name, candidates, ..
+            } => {
                 assert_eq!(name, "libfoo.so");
                 assert_eq!(candidates.len(), 2);
             }
@@ -409,7 +423,7 @@ mod tests {
     #[test]
     fn corrupt_pe_export_directory_is_an_error() {
         let module = test_module();
-        let error = parse_exports(&module, &pe_with_corrupt_export_directory())
+        let error = parse_exports(42, &module, &pe_with_corrupt_export_directory())
             .expect_err("a present but malformed export directory must fail");
         match error {
             Error::ModuleExports { reason, .. } => {
@@ -424,7 +438,7 @@ mod tests {
         use std::error::Error as _;
 
         let module = test_module();
-        let error = parse_exports(&module, b"\x7fELF not actually an ELF file")
+        let error = parse_exports(42, &module, b"\x7fELF not actually an ELF file")
             .expect_err("malformed ELF must fail");
         assert!(matches!(error, Error::ModuleParse { .. }), "{error:?}");
         assert!(
@@ -433,7 +447,7 @@ mod tests {
         );
 
         let error =
-            parse_exports(&module, b"not an executable").expect_err("unknown format must fail");
+            parse_exports(42, &module, b"not an executable").expect_err("unknown format must fail");
         assert!(matches!(error, Error::ModuleExports { .. }), "{error:?}");
         assert!(error.source().is_none());
     }

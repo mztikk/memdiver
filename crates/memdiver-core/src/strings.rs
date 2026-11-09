@@ -290,7 +290,11 @@ mod tests {
                 buffer.fill(b'x');
                 Ok(())
             } else {
-                Err(Error::AddressSpaceReplaced {
+                // AddressRange is fatal for a string read; use it here because
+                // core tests cannot construct an OsError for
+                // AddressSpaceReplaced. The exec integration test covers the
+                // address-space-replacement path.
+                Err(Error::AddressRange {
                     pid: 1,
                     address,
                     len: buffer.len(),
@@ -298,8 +302,8 @@ mod tests {
             }
         };
         let error = read_c_string_with(1, Address::new(BASE), STRING_CHUNK_BYTES * 2, &mut read)
-            .expect_err("a replaced address space must abort");
-        assert!(matches!(error, Error::AddressSpaceReplaced { .. }));
+            .expect_err("a fatal later-chunk error must abort");
+        assert!(matches!(error, Error::AddressRange { .. }));
     }
 
     #[test]

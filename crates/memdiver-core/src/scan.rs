@@ -53,6 +53,7 @@ impl Process {
         pattern: &Pattern,
     ) -> Result<Option<Address>> {
         let module = self.module(module)?.ok_or_else(|| Error::ModuleNotFound {
+            pid: self.pid,
             name: module.to_owned(),
         })?;
         let regions = self.scan_regions()?;
@@ -113,6 +114,7 @@ impl Process {
         let limit = result_limit(options);
         for range in scan_ranges(&regions, None) {
             scan_range_with(
+                self.pid,
                 range.base,
                 range.size,
                 pattern,
@@ -144,6 +146,7 @@ impl Process {
         options: &ScanOptions,
     ) -> Result<Vec<Address>> {
         let module = self.module(module)?.ok_or_else(|| Error::ModuleNotFound {
+            pid: self.pid,
             name: module.to_owned(),
         })?;
         let regions = self.scan_regions()?;
@@ -170,6 +173,7 @@ impl Process {
     ) -> Result<()> {
         for range in scan_ranges(regions, Some(module)) {
             scan_range_with(
+                self.pid,
                 range.base,
                 range.size,
                 pattern,
@@ -265,7 +269,12 @@ fn result_limit(options: &ScanOptions) -> usize {
     }
 }
 
+// The parameters are the range, its process context, the pattern/options and the
+// output buffer; a context struct would obscure the hot call sites for little
+// benefit.
+#[allow(clippy::too_many_arguments)]
 fn scan_range_with<F>(
+    pid: u32,
     base: Address,
     size: u64,
     pattern: &Pattern,
@@ -287,7 +296,9 @@ where
     let overlap = pattern_len as u64 - 1;
     let max_buffer_len = step_u64.saturating_add(overlap).min(size);
     let max_buffer_len = usize::try_from(max_buffer_len).map_err(|_| Error::InvalidLength {
+        pid,
         operation: "pattern scan",
+        address: base,
         len: usize::MAX,
     })?;
 
@@ -301,9 +312,14 @@ where
 
     let mut offset = 0u64;
     while offset < size && hits.len() < limit {
+        let Some(address) = base.checked_add(offset) else {
+            break;
+        };
         let want = step_u64.saturating_add(overlap).min(size - offset);
         let want = usize::try_from(want).map_err(|_| Error::InvalidLength {
+            pid,
             operation: "pattern scan",
+            address,
             len: usize::MAX,
         })?;
         if want < pattern_len {
@@ -311,9 +327,6 @@ where
         }
         buffer.clear();
         buffer.resize(want, 0);
-        let Some(address) = base.checked_add(offset) else {
-            break;
-        };
         match read(address, &mut buffer) {
             Ok(()) => scan_buffer(&buffer, address, pattern, options, limit, hits)?,
             Err(error) if is_fatal_scan_error(&error) => return Err(error),
@@ -394,6 +407,7 @@ mod tests {
     ) -> Vec<Address> {
         let mut hits = Vec::new();
         scan_range_with(
+            1,
             Address::new(base),
             data.len() as u64,
             pattern,
@@ -546,6 +560,7 @@ mod tests {
         let pattern = Pattern::parse("AA BB").expect("pattern");
         let mut hits = Vec::new();
         scan_range_with(
+            1,
             Address::new(BASE),
             data.len() as u64,
             &pattern,
@@ -554,7 +569,9 @@ mod tests {
             &mut hits,
             |_, _| {
                 Err(Error::InvalidLength {
+                    pid: 1,
                     operation: "test",
+                    address: Address::new(BASE),
                     len: 0,
                 })
             },

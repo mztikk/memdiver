@@ -379,6 +379,8 @@ impl Process {
             return Err(Error::ReadOnly {
                 pid: self.pid,
                 operation: "Process::write",
+                address,
+                len: buffer.len(),
             });
         }
         validate_range(self.pid, address, buffer.len())?;
@@ -448,6 +450,8 @@ impl Process {
             return Err(Error::ReadOnly {
                 pid: self.pid,
                 operation: "Process::write_code",
+                address,
+                len: buffer.len(),
             });
         }
         let _protection = self.protection_guard();
@@ -510,6 +514,7 @@ impl Process {
                 pid: self.pid,
                 address,
                 len,
+                source,
             },
             _ => match source.transferred() {
                 Some(transferred) if transferred < len => Error::PartialRead {
@@ -534,6 +539,7 @@ impl Process {
                 pid: self.pid,
                 address,
                 len,
+                source,
             },
             _ => match source.transferred() {
                 Some(transferred) if transferred < len => Error::PartialWrite {
@@ -577,6 +583,7 @@ impl Process {
                     pid: self.pid,
                     address,
                     len,
+                    source: *source,
                 }
             }
             CodeWriteFailure::Write(source) => match source.transferred() {
@@ -663,6 +670,8 @@ impl Process {
             return Err(Error::ReadOnly {
                 pid: self.pid,
                 operation: "Process::write_value",
+                address,
+                len: size_of::<T>(),
             });
         }
         self.write(address, bytemuck::bytes_of(&value))
@@ -840,11 +849,15 @@ impl Process {
             return Err(Error::ReadOnly {
                 pid: self.pid,
                 operation: "Process::protect",
+                address,
+                len,
             });
         }
         if len == 0 {
             return Err(Error::InvalidLength {
+                pid: self.pid,
                 operation: "Process::protect",
+                address,
                 len,
             });
         }

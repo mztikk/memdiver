@@ -125,6 +125,9 @@ pub enum Error {
         address: Address,
         /// Number of bytes requested.
         len: usize,
+        /// Underlying operating-system error.
+        #[source]
+        source: OsError,
     },
 
     /// Enumerating memory regions or modules failed.
@@ -174,10 +177,16 @@ pub enum Error {
     },
 
     /// The operation requires a non-empty range.
-    #[error("{operation} requires a non-empty range, but the length was {len}")]
+    #[error(
+        "{operation} at {address} in process {pid} requires a non-empty range, but the length was {len}"
+    )]
     InvalidLength {
+        /// PID of the target process.
+        pid: u32,
         /// Operation that rejected the length.
         operation: &'static str,
+        /// Address of the rejected range.
+        address: Address,
         /// Length that was supplied.
         len: usize,
     },
@@ -234,12 +243,18 @@ pub enum Error {
     },
 
     /// The handle was opened without write access.
-    #[error("process {pid} was opened read-only; {operation} requires write access")]
+    #[error(
+        "process {pid} was opened read-only; {operation} at {address} ({len} bytes) requires write access"
+    )]
     ReadOnly {
         /// PID of the target process.
         pid: u32,
         /// Operation that was rejected.
         operation: &'static str,
+        /// Address of the rejected range.
+        address: Address,
+        /// Length of the rejected range.
+        len: usize,
     },
 
     /// Enumerating processes failed.
@@ -251,8 +266,10 @@ pub enum Error {
     },
 
     /// A module file could not be read for export resolution.
-    #[error("failed to read module {module:?} from {path:?}: {source}")]
+    #[error("failed to read module {module:?} from {path:?} in process {pid}: {source}")]
     ModuleFile {
+        /// PID of the target process.
+        pid: u32,
         /// Module whose file was read.
         module: String,
         /// Path that was read.
@@ -263,19 +280,27 @@ pub enum Error {
     },
 
     /// A module file could not be parsed for export resolution.
-    #[error("failed to parse exports for module {module:?}: {reason}")]
+    #[error("failed to parse exports for module {module:?} at {path:?} in process {pid}: {reason}")]
     ModuleExports {
+        /// PID of the target process.
+        pid: u32,
         /// Module that was being parsed.
         module: String,
+        /// Path of the module file.
+        path: std::path::PathBuf,
         /// Description of the parse or format failure.
         reason: String,
     },
 
     /// A module file's format could not be parsed; the parser error is retained.
-    #[error("failed to parse exports for module {module:?}: {reason}")]
+    #[error("failed to parse exports for module {module:?} at {path:?} in process {pid}: {reason}")]
     ModuleParse {
+        /// PID of the target process.
+        pid: u32,
         /// Module that was being parsed.
         module: String,
+        /// Path of the module file.
+        path: std::path::PathBuf,
         /// Description of the parse failure.
         reason: String,
         /// Underlying parser error.
@@ -288,6 +313,8 @@ pub enum Error {
         "module name {name:?} matches multiple modules; use a module handle or a more specific name"
     )]
     AmbiguousModuleName {
+        /// PID of the target process.
+        pid: u32,
         /// Name that was requested.
         name: String,
         /// Matching modules, sorted by load address.
@@ -418,8 +445,10 @@ pub enum Error {
     },
 
     /// No loaded module matched the requested name.
-    #[error("module {name:?} is not loaded in the target process")]
+    #[error("module {name:?} is not loaded in process {pid}")]
     ModuleNotFound {
+        /// PID of the target process.
+        pid: u32,
         /// Module name that was requested.
         name: String,
     },
@@ -464,6 +493,36 @@ mod tests {
         assert!(message.contains("0x1000"));
         assert!(message.contains("process 42"));
         assert!(message.contains("8 of 16"));
+    }
+
+    #[test]
+    fn policy_and_module_errors_carry_context() {
+        let read_only = Error::ReadOnly {
+            pid: 7,
+            operation: "Process::write",
+            address: Address::new(0x1000),
+            len: 4,
+        };
+        let message = read_only.to_string();
+        assert!(message.contains("process 7"), "{message}");
+        assert!(message.contains("0x1000"), "{message}");
+        assert!(message.contains("4 bytes"), "{message}");
+
+        let invalid = Error::InvalidLength {
+            pid: 7,
+            operation: "Process::protect",
+            address: Address::new(0x2000),
+            len: 0,
+        };
+        let message = invalid.to_string();
+        assert!(message.contains("process 7"), "{message}");
+        assert!(message.contains("0x2000"), "{message}");
+
+        let missing = Error::ModuleNotFound {
+            pid: 7,
+            name: "libmissing.so".to_owned(),
+        };
+        assert!(missing.to_string().contains("process 7"), "{missing}");
     }
 
     #[test]
