@@ -199,11 +199,16 @@ pub enum ErrorKind {
 /// platforms. The code is also available separately through [`Error::raw_code`].
 /// Higher layers attach process, address and length context and expose this type
 /// as the error source.
+///
+/// A failed Windows transfer may copy a prefix of the requested range before
+/// reporting the failure; [`Error::transferred`] exposes that count so callers
+/// can report a partial transfer instead of discarding the prefix.
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
     raw_code: Option<i32>,
     message: String,
+    transferred: Option<usize>,
 }
 
 impl Error {
@@ -212,6 +217,7 @@ impl Error {
             kind,
             raw_code,
             message: message.into(),
+            transferred: None,
         }
     }
 
@@ -239,6 +245,24 @@ impl Error {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// Returns the number of bytes the operating-system call transferred before
+    /// it failed, when the platform reports one.
+    ///
+    /// This is `Some` for a Windows `ReadProcessMemory`/`WriteProcessMemory`
+    /// failure that copied a prefix of the range; a short *successful* Linux
+    /// transfer is returned as a byte count instead. The failure remains an
+    /// error either way.
+    #[must_use]
+    pub fn transferred(&self) -> Option<usize> {
+        self.transferred
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn with_transferred(mut self, transferred: usize) -> Self {
+        self.transferred = Some(transferred);
+        self
+    }
 }
 
 impl fmt::Display for Error {
@@ -251,6 +275,8 @@ impl std::error::Error for Error {}
 
 /// A page whose original protection could not be restored after a scoped code
 /// write.
+///
+/// The source is boxed so the composite [`CodeWriteError`] stays small.
 #[derive(Debug)]
 pub struct RestoreFailure {
     /// Address of the page whose protection could not be restored.
@@ -258,14 +284,15 @@ pub struct RestoreFailure {
     /// Number of bytes covered by the failed restoration.
     pub len: usize,
     /// Operating-system error from restoring the protection.
-    pub source: Error,
+    pub source: Box<Error>,
 }
 
 /// The step of a scoped code write that failed.
 ///
 /// A [`CodeWriteFailure::Protect`] failure names the page whose protection
 /// could not be changed; a [`CodeWriteFailure::Write`] failure covers the whole
-/// requested range.
+/// requested range. The underlying [`Error`] is boxed so this composite type
+/// stays small.
 #[derive(Debug)]
 pub enum CodeWriteFailure {
     /// Changing the protection of one page failed.
@@ -275,10 +302,10 @@ pub enum CodeWriteFailure {
         /// Number of bytes covered by the failed protection change.
         len: usize,
         /// Operating-system error from the protection change.
-        source: Error,
+        source: Box<Error>,
     },
     /// Writing the bytes failed.
-    Write(Error),
+    Write(Box<Error>),
 }
 
 /// The result of a failed [`ProcessHandle::write_code`] call.
@@ -421,6 +448,17 @@ mod tests {
     fn error_display_is_the_platform_message() {
         let error = Error::new(ErrorKind::Other, Some(2), io_message(2));
         assert_eq!(error.to_string(), error.message());
+    }
+
+    #[test]
+    fn partial_transfer_count_is_available() {
+        assert_eq!(
+            Error::new(ErrorKind::Other, None, "failed").transferred(),
+            None
+        );
+        let error = Error::new(ErrorKind::InvalidAddress, Some(299), "partial").with_transferred(7);
+        assert_eq!(error.transferred(), Some(7));
+        assert_eq!(error.kind(), ErrorKind::InvalidAddress);
     }
 
     #[test]

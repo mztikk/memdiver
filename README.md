@@ -257,8 +257,8 @@ match Process::open(1234) {
 Transfers are all-or-nothing from the API's perspective. A short OS transfer is
 an error, even though the caller's buffer may contain the bytes that were
 transferred before the failure. On Windows the OS can copy a partial buffer and
-then fail the call; `memdiver` reports a write/read error in that case and does
-not claim success.
+then fail the call; `memdiver` reports `PartialRead`/`PartialWrite` with the
+copied count in that case and never claims success.
 
 Scoped code writes add `Error::CodeWrite` and `Error::CodeWriteRestore` for the
 case where restoration of the original page protection also fails. Both variants
@@ -297,6 +297,9 @@ with process, address, and range context.
 * The process start time from `/proc/<pid>/stat` is captured at open time and
   compared on later queries, so a reused PID is not mistaken for the original
   process. Zombies are reported as not alive.
+* C and UTF-16 string reads return the readable prefix when a later chunk hits
+  the end of a mapping; address-space replacement, process exit, range overflow
+  and allocation failures still abort the read.
 * The pinned `/proc/<pid>/mem` descriptor refers to the address space at open
   time. A target `execve` keeps the PID and start time but installs a new
   address space; subsequent reads return `Error::AddressSpaceReplaced`. Open a

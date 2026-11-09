@@ -206,7 +206,8 @@ impl ProcessHandle {
     /// # Errors
     ///
     /// Returns an error when the address cannot be represented on this host or
-    /// when `ReadProcessMemory` fails.
+    /// when `ReadProcessMemory` fails. A failure that copied a prefix of the
+    /// range exposes the count through [`Error::transferred`].
     pub fn read(&self, address: u64, buffer: &mut [u8]) -> Result<usize, Error> {
         if buffer.is_empty() {
             return Ok(0);
@@ -231,7 +232,7 @@ impl ProcessHandle {
             // pinned handle before classifying so a scan racing process exit
             // sees ProcessExited and aborts instead of skipping the chunk.
             self.ensure_alive()?;
-            return Err(win_error(code));
+            return Err(partial_transfer_error(code, transferred, buffer.len()));
         }
         Ok(transferred)
     }
@@ -245,7 +246,8 @@ impl ProcessHandle {
     /// # Errors
     ///
     /// Returns an error when the address cannot be represented on this host or
-    /// when `WriteProcessMemory` fails.
+    /// when `WriteProcessMemory` fails. A failure that copied a prefix of the
+    /// range exposes the count through [`Error::transferred`].
     pub fn write(&self, address: u64, buffer: &[u8]) -> Result<usize, Error> {
         if buffer.is_empty() {
             return Ok(0);
@@ -269,7 +271,7 @@ impl ProcessHandle {
             // ERROR_PARTIAL_COPY, which must not be mistaken for an ordinary
             // unmapped range.
             self.ensure_alive()?;
-            return Err(win_error(code));
+            return Err(partial_transfer_error(code, transferred, buffer.len()));
         }
         Ok(transferred)
     }
@@ -304,9 +306,11 @@ impl ProcessHandle {
         }
         let len = buffer.len();
         let address_usize = checked_address(address, len)
-            .map_err(|source| CodeWriteError::Failed(CodeWriteFailure::Write(source)))?;
+            .map_err(|source| CodeWriteError::Failed(CodeWriteFailure::Write(Box::new(source))))?;
         let end = address_usize.checked_add(len).ok_or_else(|| {
-            CodeWriteError::Failed(CodeWriteFailure::Write(invalid_address(address, len)))
+            CodeWriteError::Failed(CodeWriteFailure::Write(Box::new(invalid_address(
+                address, len,
+            ))))
         })?;
         self.ensure_range_committed(address_usize, end)?;
 
@@ -319,7 +323,7 @@ impl ProcessHandle {
                 CodeWriteError::Failed(CodeWriteFailure::Protect {
                     address: first_page as u64,
                     len: end - address_usize,
-                    source: Error::malformed("page count overflowed"),
+                    source: Box::new(Error::malformed("page count overflowed")),
                 })
             })?;
 
@@ -328,11 +332,11 @@ impl ProcessHandle {
             CodeWriteError::Failed(CodeWriteFailure::Protect {
                 address: first_page as u64,
                 len: page_count.saturating_mul(page_size),
-                source: Error::new(
+                source: Box::new(Error::new(
                     ErrorKind::Other,
                     None,
                     "could not allocate the page protection table",
-                ),
+                )),
             })
         })?;
 
@@ -344,7 +348,7 @@ impl ProcessHandle {
                     CodeWriteError::Failed(CodeWriteFailure::Protect {
                         address: first_page as u64,
                         len: end - address_usize,
-                        source: Error::malformed("page address overflowed"),
+                        source: Box::new(Error::malformed("page address overflowed")),
                     })
                 })?;
             let mut previous: PAGE_PROTECTION_FLAGS = 0;
@@ -364,7 +368,7 @@ impl ProcessHandle {
                 let failure = CodeWriteFailure::Protect {
                     address: page as u64,
                     len: page_size,
-                    source: last_error(),
+                    source: Box::new(last_error()),
                 };
                 let (restore, additional_restore_failures) =
                     self.restore_pages(&changed, page_size);
@@ -389,9 +393,11 @@ impl ProcessHandle {
                 restore,
                 additional_restore_failures,
             }),
-            (Err(source), None) => Err(CodeWriteError::Failed(CodeWriteFailure::Write(source))),
+            (Err(source), None) => Err(CodeWriteError::Failed(CodeWriteFailure::Write(Box::new(
+                source,
+            )))),
             (Err(source), Some(restore)) => Err(CodeWriteError::RestoreFailedAfterFailure {
-                failure: CodeWriteFailure::Write(source),
+                failure: CodeWriteFailure::Write(Box::new(source)),
                 restore,
                 additional_restore_failures,
             }),
@@ -428,7 +434,7 @@ impl ProcessHandle {
                 let failure = RestoreFailure {
                     address: page as u64,
                     len: page_size,
-                    source: last_error(),
+                    source: Box::new(last_error()),
                 };
                 if first.is_none() {
                     first = Some(failure);
@@ -462,18 +468,18 @@ impl ProcessHandle {
                 return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
                     address: current as u64,
                     len: end - current,
-                    source: last_error(),
+                    source: Box::new(last_error()),
                 }));
             }
             if info.State != MEM_COMMIT {
                 return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
                     address: current as u64,
                     len: end - current,
-                    source: Error::new(
+                    source: Box::new(Error::new(
                         ErrorKind::InvalidAddress,
                         None,
                         format!("address {current:#x} is not committed memory"),
-                    ),
+                    )),
                 }));
             }
             let base = info.BaseAddress as usize;
@@ -481,16 +487,18 @@ impl ProcessHandle {
                 CodeWriteError::Failed(CodeWriteFailure::Protect {
                     address: current as u64,
                     len: end - current,
-                    source: Error::malformed("VirtualQueryEx returned a wrapping region"),
+                    source: Box::new(Error::malformed(
+                        "VirtualQueryEx returned a wrapping region",
+                    )),
                 })
             })?;
             if base > current || region_end <= current {
                 return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
                     address: current as u64,
                     len: end - current,
-                    source: Error::malformed(
+                    source: Box::new(Error::malformed(
                         "VirtualQueryEx returned a region that does not cover the queried address",
-                    ),
+                    )),
                 }));
             }
             current = region_end.min(end);
@@ -1175,7 +1183,9 @@ fn system_page_size() -> Result<usize, CodeWriteError> {
         return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
             address: 0,
             len: 0,
-            source: Error::malformed("GetSystemInfo returned an invalid page size"),
+            source: Box::new(Error::malformed(
+                "GetSystemInfo returned an invalid page size",
+            )),
         }));
     }
     Ok(page_size)
@@ -1285,6 +1295,19 @@ fn last_error_code() -> u32 {
 
 fn last_error() -> Error {
     win_error(last_error_code())
+}
+
+/// Builds a failed-transfer error and records any prefix the OS copied.
+///
+/// The failure remains an error; the count only lets the safe layer report
+/// `PartialRead`/`PartialWrite` with both counts.
+fn partial_transfer_error(code: u32, transferred: usize, requested: usize) -> Error {
+    let error = win_error(code);
+    if transferred > 0 && transferred < requested {
+        error.with_transferred(transferred)
+    } else {
+        error
+    }
 }
 
 fn io_error(error: std::io::Error) -> Error {

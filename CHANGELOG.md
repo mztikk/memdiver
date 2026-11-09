@@ -7,6 +7,19 @@ version is bumped for backwards-incompatible changes.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `memdiver_sys::CodeWriteFailure::Protect.source`, `CodeWriteFailure::Write`
+  and `RestoreFailure.source` now carry a boxed `memdiver_sys::Error`. The
+  composite error is a cold path and boxing keeps `CodeWriteError` small now
+  that `Error` carries a partial-transfer count; dereference the box when
+  matching or constructing these values.
+
+### Added
+
+- `memdiver_sys::Error::transferred` exposes the number of bytes a failed
+  Windows transfer copied before failing.
+
 ### Fixed
 
 - Windows: a failed `ReadProcessMemory`/`WriteProcessMemory` against an exited
@@ -21,6 +34,13 @@ version is bumped for backwards-incompatible changes.
   handle, so concurrent calls through one handle cannot interleave their
   protect/write/restore steps and leave a page writable and executable. Separate
   handles are documented as uncoordinated.
+- Windows `ReadProcessMemory`/`WriteProcessMemory` failures that copy a prefix
+  now expose the copied count (`memdiver_sys::Error::transferred`) and are
+  reported as `PartialRead`/`PartialWrite` by the safe API instead of a generic
+  read/write error.
+- C and UTF-16 string reads return the readable prefix when a later chunk hits
+  the end of a mapping, on every platform. Address-space replacement, process
+  exit, range overflow and allocation failures still abort the read.
 
 ## [0.2.0] - 2026-11-08
 

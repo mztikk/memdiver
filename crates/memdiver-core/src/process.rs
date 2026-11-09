@@ -295,8 +295,10 @@ impl Process {
     /// read fails, [`Error::AddressRange`] when the range overflows,
     /// [`Error::AddressSpaceReplaced`] when the target replaced its address
     /// space after opening, or [`Error::PartialRead`] when the operating system
-    /// transfers fewer bytes than requested. On any error the contents of
-    /// `buffer` are unspecified; inspect the `transferred` count in a
+    /// transfers fewer bytes than requested. On Windows a failed
+    /// `ReadProcessMemory` that copied a prefix is reported as
+    /// [`Error::PartialRead`] with the copied count. On any error the contents
+    /// of `buffer` are unspecified; inspect the `transferred` count in a
     /// partial-read error.
     pub fn read(&self, address: Address, buffer: &mut [u8]) -> Result<()> {
         if buffer.is_empty() {
@@ -347,7 +349,9 @@ impl Process {
     /// write fails, [`Error::AddressRange`] when the range overflows,
     /// [`Error::AddressSpaceReplaced`] when the target replaced its address
     /// space after opening, or [`Error::PartialWrite`] when the operating
-    /// system transfers fewer bytes than requested. A failed or partial write
+    /// system transfers fewer bytes than requested. On Windows a failed
+    /// `WriteProcessMemory` that copied a prefix is reported as
+    /// [`Error::PartialWrite`] with the copied count. A failed or partial write
     /// may already have modified the target.
     pub fn write(&self, address: Address, buffer: &[u8]) -> Result<()> {
         if buffer.is_empty() {
@@ -489,11 +493,19 @@ impl Process {
                 address,
                 len,
             },
-            _ => Error::Read {
-                pid: self.pid,
-                address,
-                len,
-                source,
+            _ => match source.transferred() {
+                Some(transferred) if transferred < len => Error::PartialRead {
+                    pid: self.pid,
+                    address,
+                    requested: len,
+                    transferred,
+                },
+                _ => Error::Read {
+                    pid: self.pid,
+                    address,
+                    len,
+                    source,
+                },
             },
         }
     }
@@ -505,11 +517,19 @@ impl Process {
                 address,
                 len,
             },
-            _ => Error::Write {
-                pid: self.pid,
-                address,
-                len,
-                source,
+            _ => match source.transferred() {
+                Some(transferred) if transferred < len => Error::PartialWrite {
+                    pid: self.pid,
+                    address,
+                    requested: len,
+                    transferred,
+                },
+                _ => Error::Write {
+                    pid: self.pid,
+                    address,
+                    len,
+                    source,
+                },
             },
         }
     }
@@ -529,7 +549,7 @@ impl Process {
                     pid: self.pid,
                     address: Address::new(page),
                     len: page_len,
-                    source,
+                    source: *source,
                 },
             },
             CodeWriteFailure::Write(source)
@@ -541,11 +561,19 @@ impl Process {
                     len,
                 }
             }
-            CodeWriteFailure::Write(source) => Error::Write {
-                pid: self.pid,
-                address,
-                len,
-                source,
+            CodeWriteFailure::Write(source) => match source.transferred() {
+                Some(transferred) if transferred < len => Error::PartialWrite {
+                    pid: self.pid,
+                    address,
+                    requested: len,
+                    transferred,
+                },
+                _ => Error::Write {
+                    pid: self.pid,
+                    address,
+                    len,
+                    source: *source,
+                },
             },
         }
     }
@@ -555,7 +583,7 @@ impl Process {
             pid: self.pid,
             address: Address::new(restore.address),
             len: restore.len,
-            source: restore.source,
+            source: *restore.source,
         }
     }
 

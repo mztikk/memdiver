@@ -78,7 +78,9 @@ pub enum Error {
     /// The operating system transferred fewer bytes than requested.
     ///
     /// The caller's buffer may contain a partial result up to `transferred`
-    /// bytes; the library never silently truncates a successful transfer.
+    /// bytes; the library never silently truncates a successful transfer. On
+    /// Windows this also represents a failed `ReadProcessMemory` call that
+    /// copied a prefix of the range; the call is still an error.
     #[error(
         "short read at {address} in process {pid}: transferred {transferred} of {requested} bytes"
     )]

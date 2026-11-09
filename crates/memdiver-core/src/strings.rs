@@ -1,6 +1,7 @@
 //! Bounded string reads.
 
 use memchr::memchr;
+use memdiver_sys::ErrorKind as OsErrorKind;
 
 use crate::{Address, Error, Process, Result};
 
@@ -12,15 +13,19 @@ impl Process {
     /// At most `max_bytes` bytes are read. The returned bytes exclude the NUL
     /// terminator. If no NUL is found within the limit, the limit-sized prefix
     /// is returned; callers that need to distinguish truncation can compare the
-    /// returned length with `max_bytes`. If a chunk run crosses into
-    /// inaccessible memory, the readable prefix is returned instead of failing
-    /// when the terminator was already in the readable part.
+    /// returned length with `max_bytes`.
+    ///
+    /// If a later chunk cannot be read because the mapping ended, the bytes read
+    /// so far are returned (with or without a partial-transfer count). A read
+    /// failure on the first chunk is an error, as are address-space
+    /// replacement, process exit, range overflow and allocation failure.
     ///
     /// # Errors
     ///
-    /// Returns read errors for inaccessible memory, [`Error::AddressRange`]
-    /// when the range wraps, or [`Error::Allocation`] when the result cannot be
-    /// grown. A first chunk that transfers zero bytes is an error.
+    /// Returns read errors for an inaccessible first chunk,
+    /// [`Error::AddressSpaceReplaced`] or a process exit anywhere in the string,
+    /// [`Error::AddressRange`] when the range wraps, or [`Error::Allocation`]
+    /// when the result cannot be grown.
     pub fn read_c_string(&self, address: Address, max_bytes: usize) -> Result<Vec<u8>> {
         read_c_string_with(self.pid, address, max_bytes, |address, buffer| {
             self.read(address, buffer)
@@ -42,14 +47,16 @@ impl Process {
     /// At most `max_units` UTF-16 code units are read. The returned string
     /// excludes the terminator and is decoded lossily, replacing unpaired
     /// surrogates. If no terminator is found within the limit, the prefix is
-    /// decoded and returned. If a chunk crosses into inaccessible memory, the
-    /// readable prefix is returned.
+    /// decoded and returned. If a later chunk cannot be read because the
+    /// mapping ended, the units read so far are returned; a read failure on the
+    /// first chunk is an error.
     ///
     /// # Errors
     ///
-    /// Returns read errors for inaccessible memory, [`Error::AddressRange`]
-    /// when the range wraps, or [`Error::Allocation`] when the result cannot be
-    /// grown. A first chunk that transfers zero bytes is an error.
+    /// Returns read errors for an inaccessible first chunk,
+    /// [`Error::AddressSpaceReplaced`] or a process exit anywhere in the string,
+    /// [`Error::AddressRange`] when the range wraps, or [`Error::Allocation`]
+    /// when the result cannot be grown.
     pub fn read_utf16_string(&self, address: Address, max_units: usize) -> Result<String> {
         read_utf16_string_with(self.pid, address, max_units, |address, buffer| {
             self.read(address, buffer)
@@ -88,7 +95,16 @@ where
             {
                 transferred
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // A later chunk that cannot be read means the readable run
+                // ended; return what was read so far. A fatal error (process
+                // exit, replaced address space, overflow or allocation) is
+                // always propagated.
+                if offset > 0 && !string_read_aborts(&error) {
+                    return Ok(result);
+                }
+                return Err(error);
+            }
         };
         let chunk = &buffer[..filled];
         if let Some(position) = memchr(0, chunk) {
@@ -161,7 +177,12 @@ where
             {
                 transferred
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if offset_units > 0 && !string_read_aborts(&error) {
+                    return Ok(String::from_utf16_lossy(&units));
+                }
+                return Err(error);
+            }
         };
 
         // A partial transfer can end on an odd byte; only whole UTF-16 units
@@ -186,6 +207,17 @@ where
         offset_units += chunk_units;
     }
     Ok(String::from_utf16_lossy(&units))
+}
+
+/// Returns `true` when a failed string chunk must abort the whole read rather
+/// than being treated as the end of the readable mapping.
+fn string_read_aborts(error: &Error) -> bool {
+    match error {
+        Error::AddressSpaceReplaced { .. } => true,
+        Error::Read { source, .. } => matches!(source.kind(), OsErrorKind::ProcessExited),
+        Error::AddressRange { .. } | Error::Allocation { .. } => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +261,68 @@ mod tests {
         let mut read = bounded_read(b"abcdefgh", 8);
         let value = read_c_string_with(1, Address::new(BASE), 64, &mut read).expect("prefix");
         assert_eq!(value, b"abcdefgh");
+    }
+
+    #[test]
+    fn c_string_later_chunk_failure_returns_the_readable_prefix() {
+        let mut read = |address: Address, buffer: &mut [u8]| {
+            if address.get() == BASE {
+                buffer.fill(b'x');
+                Ok(())
+            } else {
+                Err(Error::PartialRead {
+                    pid: 1,
+                    address,
+                    requested: buffer.len(),
+                    transferred: 0,
+                })
+            }
+        };
+        let value = read_c_string_with(1, Address::new(BASE), STRING_CHUNK_BYTES * 2, &mut read)
+            .expect("later inaccessible chunk returns the prefix");
+        assert_eq!(value, vec![b'x'; STRING_CHUNK_BYTES]);
+    }
+
+    #[test]
+    fn c_string_later_chunk_fatal_error_is_propagated() {
+        let mut read = |address: Address, buffer: &mut [u8]| {
+            if address.get() == BASE {
+                buffer.fill(b'x');
+                Ok(())
+            } else {
+                Err(Error::AddressSpaceReplaced {
+                    pid: 1,
+                    address,
+                    len: buffer.len(),
+                })
+            }
+        };
+        let error = read_c_string_with(1, Address::new(BASE), STRING_CHUNK_BYTES * 2, &mut read)
+            .expect_err("a replaced address space must abort");
+        assert!(matches!(error, Error::AddressSpaceReplaced { .. }));
+    }
+
+    #[test]
+    fn utf16_string_later_chunk_failure_returns_complete_units() {
+        let mut read = |address: Address, buffer: &mut [u8]| {
+            if address.get() == BASE {
+                for unit in buffer.chunks_exact_mut(2) {
+                    unit.copy_from_slice(&u16::from(b'a').to_le_bytes());
+                }
+                Ok(())
+            } else {
+                Err(Error::PartialRead {
+                    pid: 1,
+                    address,
+                    requested: buffer.len(),
+                    transferred: 0,
+                })
+            }
+        };
+        let units = (STRING_CHUNK_BYTES / 2) * 2;
+        let value = read_utf16_string_with(1, Address::new(BASE), units, &mut read)
+            .expect("later inaccessible chunk returns the units");
+        assert_eq!(value, "a".repeat(STRING_CHUNK_BYTES / 2));
     }
 
     #[test]

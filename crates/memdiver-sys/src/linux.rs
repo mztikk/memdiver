@@ -232,7 +232,7 @@ impl ProcessHandle {
             return Ok(0);
         }
         self.write(address, buffer)
-            .map_err(|source| CodeWriteError::Failed(CodeWriteFailure::Write(source)))
+            .map_err(|source| CodeWriteError::Failed(CodeWriteFailure::Write(Box::new(source))))
     }
 
     /// Returns whether the process is still running.
