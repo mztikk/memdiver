@@ -66,6 +66,10 @@ version is bumped for backwards-incompatible changes.
 - `Module::contains` and module-scoped scans now use a module's exact mappings
   instead of its address span, so readable memory in an unmapped gap (or another
   module mapped inside the span) is no longer treated as part of the module.
+- Windows module-file resolution rejects UNC/network and device-namespace paths
+  before opening them, and refuses a PE file whose `SizeOfImage` does not match
+  the loaded module. Both prevent a target-controlled path or replaced file from
+  being parsed as the module.
 - Module-name resolution is shared by `Process::module`, module-scoped scans and
   exports. Names use the platform's process-name rules, and a name that matches
   several modules now returns `Error::AmbiguousModuleName` instead of silently

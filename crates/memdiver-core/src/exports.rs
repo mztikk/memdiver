@@ -47,8 +47,11 @@ impl Process {
     /// [`memdiver_sys::MAX_MODULE_FILE_SIZE`] bytes; device files, FIFOs,
     /// oversized files and replaced files are rejected before parsing.
     ///
-    /// PE forwarded exports and unnamed ordinal exports are skipped. On Linux,
-    /// only defined dynamic symbols with default or protected visibility are
+    /// PE forwarded exports and unnamed ordinal exports are skipped. On Windows
+    /// the module path must be an absolute local drive path (UNC/network and
+    /// device paths are rejected before opening) and the file's `SizeOfImage`
+    /// must match the live module image. On Linux, only defined dynamic symbols
+    /// with default or protected visibility are
     /// returned; when several versions of a name exist, the default (non-hidden)
     /// symbol version is returned and compatibility versions are not listed
     /// separately. Section headers are not required to discover dynamic symbols,
@@ -138,6 +141,25 @@ fn parse_exports(pid: u32, module: &Module, bytes: &[u8]) -> Result<Vec<Export>>
         elf_exports(pid, module, &elf)
     } else if bytes.starts_with(b"MZ") {
         let pe = goblin::pe::PE::parse(bytes).map_err(|error| parse_error(pid, module, error))?;
+        // Windows reports SizeOfImage for the live module. A replaced or
+        // otherwise different file usually has a different image size, so
+        // refuse to resolve exports from it. Linux module sizes are mapping
+        // spans, not PE image sizes, so the check is Windows-only.
+        #[cfg(windows)]
+        if let Some(optional_header) = pe.header.optional_header.as_ref() {
+            let file_image_size = u64::from(optional_header.windows_fields.size_of_image);
+            if file_image_size != module.size() {
+                return Err(Error::ModuleExports {
+                    pid,
+                    module: module.name().to_owned(),
+                    path: module.path().to_path_buf(),
+                    reason: format!(
+                        "module file image size {file_image_size} does not match the live image size {}",
+                        module.size()
+                    ),
+                });
+            }
+        }
         if pe_has_export_directory(&pe) && pe.export_data.is_none() {
             return Err(Error::ModuleExports {
                 pid,
@@ -374,7 +396,7 @@ mod tests {
         put32(&mut pe, optional + 36, 0x200); // file alignment
         put16(&mut pe, optional + 40, 6);
         put16(&mut pe, optional + 48, 6);
-        put32(&mut pe, optional + 56, 0x2000); // size of image
+        put32(&mut pe, optional + 56, 0x1000); // size of image, matching test_module
         put32(&mut pe, optional + 60, 0x200); // size of headers
         put16(&mut pe, optional + 68, 3); // console subsystem
         put64(&mut pe, optional + 72, 0x10_0000);
@@ -403,6 +425,26 @@ mod tests {
         match error {
             Error::ModuleExports { reason, .. } => {
                 assert!(reason.contains("export directory"), "{reason}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_pe_with_mismatched_image_size() {
+        let module = Module::from_raw(memdiver_sys::RawModule {
+            name: "test.so".to_owned(),
+            path: std::path::PathBuf::from("/test.so"),
+            base: 0x1000,
+            size: 0x2000,
+            mappings: vec![(0x1000, 0x3000)],
+        });
+        let error = parse_exports(42, &module, &pe_with_corrupt_export_directory())
+            .expect_err("a PE whose image size differs from the live module must fail");
+        match error {
+            Error::ModuleExports { reason, .. } => {
+                assert!(reason.contains("image size"), "{reason}");
             }
             other => panic!("unexpected {other:?}"),
         }

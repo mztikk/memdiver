@@ -11,7 +11,7 @@ use std::fmt;
 use std::fs::File;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr;
 use std::time::Duration;
 
@@ -704,15 +704,18 @@ impl ProcessHandle {
     /// Reads a mapped module file and returns its bytes.
     ///
     /// The module must still be present in the pinned process's module list at
-    /// `base` with the same path. The file must be a regular file no larger
-    /// than [`MAX_MODULE_FILE_SIZE`](crate::MAX_MODULE_FILE_SIZE); this rejects
+    /// `base` with the same path. The path must be an absolute local drive path;
+    /// UNC/network paths and device-namespace paths are rejected before opening.
+    /// The file must be a regular file no larger than
+    /// [`MAX_MODULE_FILE_SIZE`](crate::MAX_MODULE_FILE_SIZE); this rejects
     /// devices, FIFOs and enormous files before parsing.
     ///
     /// # Errors
     ///
     /// Returns [`ErrorKind::MalformedData`] when the module is no longer
-    /// present or the path is not a bounded regular file, and the underlying
-    /// operating-system error when the file cannot be opened or read.
+    /// present, the path is not a local drive path, or the file is not a
+    /// bounded regular file, and the underlying operating-system error when the
+    /// file cannot be opened or read.
     pub fn read_module_file(&self, base: u64, path: &Path) -> Result<Vec<u8>, Error> {
         let modules = self.modules()?;
         let present = modules
@@ -724,6 +727,7 @@ impl ProcessHandle {
                 path.display()
             )));
         }
+        validate_module_file_path(path)?;
         let file = File::open(path).map_err(io_error)?;
         crate::read_bounded_file(file, crate::MAX_MODULE_FILE_SIZE, io_error)
     }
@@ -1360,6 +1364,37 @@ fn last_error_code() -> u32 {
     unsafe { GetLastError() }
 }
 
+/// Rejects module paths that would leave the local filesystem.
+///
+/// A target controls the path reported for its modules. Opening a UNC path
+/// makes the inspecting process contact a remote SMB server (and may send NTLM
+/// authentication); a device-namespace path opens a device before the
+/// regular-file check can reject it. Only absolute local drive paths are opened.
+fn validate_module_file_path(path: &Path) -> Result<(), Error> {
+    if !path.is_absolute() {
+        return Err(Error::malformed(format!(
+            "module path {} is not an absolute local path",
+            path.display()
+        )));
+    }
+    let prefix = match path.components().next() {
+        Some(Component::Prefix(prefix)) => prefix.kind(),
+        _ => {
+            return Err(Error::malformed(format!(
+                "module path {} is not an absolute local path",
+                path.display()
+            )));
+        }
+    };
+    match prefix {
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) => Ok(()),
+        _ => Err(Error::malformed(format!(
+            "module path {} is not a local drive path; network and device paths are not opened",
+            path.display()
+        ))),
+    }
+}
+
 fn last_error() -> Error {
     win_error(last_error_code())
 }
@@ -1578,6 +1613,30 @@ mod tests {
             Some(PAGE_READONLY | PAGE_GUARD)
         );
         assert_eq!(protection_to_page(Protection::from_bits_retain(0x80)), None);
+    }
+
+    #[test]
+    fn rejects_network_and_device_module_paths() {
+        for path in [
+            Path::new(r"C:\Windows\System32\ntdll.dll"),
+            Path::new(r"\\?\C:\very\long\module.dll"),
+        ] {
+            assert!(
+                validate_module_file_path(path).is_ok(),
+                "local drive path {path:?} must be accepted"
+            );
+        }
+        for path in [
+            Path::new(r"\\server\share\module.dll"),
+            Path::new(r"\\.\PhysicalDrive0"),
+            Path::new(r"relative\module.dll"),
+            Path::new(r"C:relative\module.dll"),
+        ] {
+            assert!(
+                validate_module_file_path(path).is_err(),
+                "non-local path {path:?} must be rejected"
+            );
+        }
     }
 
     #[test]

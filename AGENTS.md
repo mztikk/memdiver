@@ -238,9 +238,11 @@ in `memdiver-sys`.
 * `enable_debug_privilege` opens the current process token, looks up
   `SeDebugPrivilege`, and adjusts it. Check `ERROR_NOT_ALL_ASSIGNED` after a
   successful `AdjustTokenPrivileges` call; map it to `PermissionDenied`.
-* PE exports are parsed by `goblin` from the module file. Include named,
-  non-forwarded exports and rebase by `live module base + RVA`; validate the
-  result stays inside the live image.
+* PE exports are parsed by `goblin` from the module file. Only absolute local
+  drive paths are opened; UNC/network and device-namespace paths are rejected
+  before opening. The file's `SizeOfImage` must match the live module image.
+  Include named, non-forwarded exports and rebase by `live module base + RVA`;
+  validate the result stays inside the live image.
 * Module enumeration can race with module load/unload. Retry a bounded number
   of times on `ERROR_PARTIAL_COPY` / `ERROR_INSUFFICIENT_BUFFER` /
   `ERROR_INVALID_HANDLE`; `ERROR_INVALID_HANDLE` from a per-module query means

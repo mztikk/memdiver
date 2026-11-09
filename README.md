@@ -385,6 +385,9 @@ cat /proc/sys/kernel/yama/ptrace_scope
 * `wait_for_exit` uses `WaitForSingleObject` on the pinned handle.
 * PE exports are parsed from the module file and converted with
   `live_module_base + RVA`; forwarded exports and unnamed ordinals are skipped.
+  Only absolute local drive paths are opened (UNC/network and device paths are
+  rejected before opening), and the file's `SizeOfImage` must match the live
+  module's image size so a replaced file is not parsed silently.
 * `enable_debug_privilege` opens the current process token and enables
   `SeDebugPrivilege`. It is opt-in, never automatic, and normally requires
   administrator rights.
@@ -430,8 +433,9 @@ required.
 * Module exports are parsed from the module file reported by the OS, not from
   the live mapped image. A deleted or replaced file, or PE forwarders and
   unnamed ordinal exports, can make the result incomplete or unavailable. On
-  Linux the file is resolved in the target's mount namespace and the inode is
-  checked; on Windows the path is opened in the caller's namespace. ELF dynamic
+  Linux the file is resolved through the pinned target descriptor and the inode
+  is checked; on Windows the path is opened in the caller's namespace and must be
+  an absolute local drive path whose `SizeOfImage` matches the live module. ELF dynamic
   symbols are read from the dynamic segment; symbol-version information needs
   the version sections, which a stripped file may lack.
 * Batched transfers are sequential under the hood; they do not currently use
