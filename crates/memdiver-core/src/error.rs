@@ -157,6 +157,10 @@ pub enum Error {
     },
 
     /// The operation is not available on this platform.
+    ///
+    /// This is a capability error, not a range failure: it intentionally carries
+    /// no process/address/length context because the platform cannot perform
+    /// the operation for any range.
     #[error("{operation} is not supported on this platform: {reason}")]
     Unsupported {
         /// Operation that was attempted.
