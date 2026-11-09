@@ -74,6 +74,9 @@ version is bumped for backwards-incompatible changes.
   `ERROR_PATH_NOT_FOUND` as `NotFound`, and module enumeration checks the pinned
   handle's liveness before retrying an `ERROR_INVALID_HANDLE`/`ERROR_PARTIAL_COPY`
   race, so an exited target reports `ProcessExited` instead of a vanished module.
+- Windows region enumeration now propagates `ProcessExited` when the target dies
+  while module paths are being filled, instead of swallowing the error and
+  reporting a best-effort path set.
 - Windows module-file resolution rejects UNC/network and device-namespace paths
   before opening them, and refuses a PE file whose `SizeOfImage` does not match
   the loaded module. Both prevent a target-controlled path or replaced file from

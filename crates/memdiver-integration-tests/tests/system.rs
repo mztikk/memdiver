@@ -150,6 +150,8 @@ fn device_backed_module_files_are_rejected_before_reading() {
 #[cfg(windows)]
 #[test]
 fn debug_privilege_helper_is_opt_in() {
+    // On an elevated runner the privilege may already be assigned, so Ok is a
+    // valid success. Ordinary CI exercises the structured error branch.
     match memdiver::enable_debug_privilege() {
         Ok(()) => {}
         Err(memdiver::Error::Privilege { source }) => {

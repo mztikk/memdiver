@@ -858,6 +858,8 @@ fn parse_stat(data: &[u8], pid: u32) -> Result<Stat, Error> {
         .next()
         .and_then(|field| field.first().copied())
         .ok_or_else(|| malformed("missing process state"))?;
+    // The state field is field 3 and starttime is field 22, so skip the 18
+    // fields between them.
     let start_time = fields
         .nth(18)
         .ok_or_else(|| malformed("missing start time"))?;

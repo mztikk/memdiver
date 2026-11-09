@@ -55,12 +55,6 @@ impl Pattern {
                 reason: "pattern must contain at least one byte".to_owned(),
             });
         }
-        if bytes.len() > MAX_PATTERN_LEN {
-            return Err(Error::InvalidPattern {
-                reason: format!("pattern is longer than {MAX_PATTERN_LEN} bytes"),
-            });
-        }
-
         Ok(Self {
             bytes,
             masks,
@@ -124,8 +118,9 @@ impl Pattern {
 /// Shortens a malformed token before it is embedded in an error message.
 fn token_preview(token: &str) -> String {
     const MAX_CHARS: usize = 32;
-    let mut preview: String = token.chars().take(MAX_CHARS).collect();
-    if token.len() > MAX_CHARS {
+    let mut chars = token.chars();
+    let mut preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
         preview.push_str("...");
     }
     preview
@@ -260,6 +255,13 @@ mod tests {
                 "{text:?}: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_the_exact_pattern_limit() {
+        let text = format!("{}AA", "AA ".repeat(MAX_PATTERN_LEN - 1));
+        let pattern = Pattern::parse(&text).expect("exactly the limit must be accepted");
+        assert_eq!(pattern.len(), MAX_PATTERN_LEN);
     }
 
     #[test]

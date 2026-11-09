@@ -328,10 +328,9 @@ impl Process {
             return Ok(());
         }
         validate_range(self.pid, address, buffer.len())?;
-        let transferred = self
-            .inner
-            .read(address.get(), buffer)
-            .map_err(|source| self.read_error(address, buffer.len(), source))?;
+        let transferred = self.inner.read(address.get(), buffer).map_err(|source| {
+            self.transfer_error(address, buffer.len(), source, TransferKind::Read)
+        })?;
         ensure_complete_read(self.pid, address, buffer.len(), transferred)
     }
 
@@ -391,10 +390,9 @@ impl Process {
             });
         }
         validate_range(self.pid, address, buffer.len())?;
-        let transferred = self
-            .inner
-            .write(address.get(), buffer)
-            .map_err(|source| self.write_error(address, buffer.len(), source))?;
+        let transferred = self.inner.write(address.get(), buffer).map_err(|source| {
+            self.transfer_error(address, buffer.len(), source, TransferKind::Write)
+        })?;
         ensure_complete_write(self.pid, address, buffer.len(), transferred)
     }
 
@@ -517,7 +515,16 @@ impl Process {
         }
     }
 
-    fn read_error(&self, address: Address, len: usize, source: memdiver_sys::Error) -> Error {
+    /// Maps a failed transfer: an address-space replacement keeps its source;
+    /// a Windows prefix copy becomes `PartialRead`/`PartialWrite`; everything
+    /// else is a full read/write failure.
+    fn transfer_error(
+        &self,
+        address: Address,
+        len: usize,
+        source: memdiver_sys::Error,
+        kind: TransferKind,
+    ) -> Error {
         match source.kind() {
             OsErrorKind::AddressSpaceReplaced => Error::AddressSpaceReplaced {
                 pid: self.pid,
@@ -526,42 +533,33 @@ impl Process {
                 source,
             },
             _ => match source.transferred() {
-                Some(transferred) if transferred < len => Error::PartialRead {
-                    pid: self.pid,
-                    address,
-                    requested: len,
-                    transferred,
+                Some(transferred) if transferred < len => match kind {
+                    TransferKind::Read => Error::PartialRead {
+                        pid: self.pid,
+                        address,
+                        requested: len,
+                        transferred,
+                    },
+                    TransferKind::Write => Error::PartialWrite {
+                        pid: self.pid,
+                        address,
+                        requested: len,
+                        transferred,
+                    },
                 },
-                _ => Error::Read {
-                    pid: self.pid,
-                    address,
-                    len,
-                    source,
-                },
-            },
-        }
-    }
-
-    fn write_error(&self, address: Address, len: usize, source: memdiver_sys::Error) -> Error {
-        match source.kind() {
-            OsErrorKind::AddressSpaceReplaced => Error::AddressSpaceReplaced {
-                pid: self.pid,
-                address,
-                len,
-                source,
-            },
-            _ => match source.transferred() {
-                Some(transferred) if transferred < len => Error::PartialWrite {
-                    pid: self.pid,
-                    address,
-                    requested: len,
-                    transferred,
-                },
-                _ => Error::Write {
-                    pid: self.pid,
-                    address,
-                    len,
-                    source,
+                _ => match kind {
+                    TransferKind::Read => Error::Read {
+                        pid: self.pid,
+                        address,
+                        len,
+                        source,
+                    },
+                    TransferKind::Write => Error::Write {
+                        pid: self.pid,
+                        address,
+                        len,
+                        source,
+                    },
                 },
             },
         }
@@ -585,30 +583,9 @@ impl Process {
                     source: *source,
                 },
             },
-            CodeWriteFailure::Write(source)
-                if source.kind() == OsErrorKind::AddressSpaceReplaced =>
-            {
-                Error::AddressSpaceReplaced {
-                    pid: self.pid,
-                    address,
-                    len,
-                    source: *source,
-                }
+            CodeWriteFailure::Write(source) => {
+                self.transfer_error(address, len, *source, TransferKind::Write)
             }
-            CodeWriteFailure::Write(source) => match source.transferred() {
-                Some(transferred) if transferred < len => Error::PartialWrite {
-                    pid: self.pid,
-                    address,
-                    requested: len,
-                    transferred,
-                },
-                _ => Error::Write {
-                    pid: self.pid,
-                    address,
-                    len,
-                    source: *source,
-                },
-            },
         }
     }
 
@@ -913,6 +890,13 @@ impl Process {
                 },
             })
     }
+}
+
+/// Direction of a failed memory transfer.
+#[derive(Clone, Copy)]
+enum TransferKind {
+    Read,
+    Write,
 }
 
 /// Returns whether an opened process's image name matches the requested name.

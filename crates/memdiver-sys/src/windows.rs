@@ -339,13 +339,10 @@ impl ProcessHandle {
             return Ok(0);
         }
         let len = buffer.len();
-        let address_usize = checked_address(address, len)
-            .map_err(|source| CodeWriteError::Failed(CodeWriteFailure::Write(Box::new(source))))?;
-        let end = address_usize.checked_add(len).ok_or_else(|| {
-            CodeWriteError::Failed(CodeWriteFailure::Write(Box::new(invalid_address(
-                address, len,
-            ))))
-        })?;
+        let address_usize = checked_address(address, len).map_err(write_failure)?;
+        let end = address_usize
+            .checked_add(len)
+            .ok_or_else(|| write_failure(invalid_address(address, len)))?;
         self.ensure_range_committed(address_usize, end)?;
 
         let page_size = system_page_size()?;
@@ -354,37 +351,31 @@ impl ProcessHandle {
         let page_count = ((last_page - first_page) / page_size)
             .checked_add(1)
             .ok_or_else(|| {
-                CodeWriteError::Failed(CodeWriteFailure::Protect {
-                    address: first_page as u64,
-                    len: end - address_usize,
-                    source: Box::new(Error::malformed("page count overflowed")),
-                })
+                protect_failure(
+                    first_page as u64,
+                    end - address_usize,
+                    Error::malformed("page count overflowed"),
+                )
             })?;
 
         let mut changed: Vec<(usize, PAGE_PROTECTION_FLAGS)> = Vec::new();
         changed.try_reserve_exact(page_count).map_err(|_| {
-            CodeWriteError::Failed(CodeWriteFailure::Protect {
-                address: first_page as u64,
-                len: page_count.saturating_mul(page_size),
-                source: Box::new(Error::new(
+            protect_failure(
+                first_page as u64,
+                page_count.saturating_mul(page_size),
+                Error::new(
                     ErrorKind::Other,
                     None,
                     "could not allocate the page protection table",
-                )),
-            })
+                ),
+            )
         })?;
 
         for index in 0..page_count {
-            let page = index
-                .checked_mul(page_size)
-                .and_then(|offset| first_page.checked_add(offset))
-                .ok_or_else(|| {
-                    CodeWriteError::Failed(CodeWriteFailure::Protect {
-                        address: first_page as u64,
-                        len: end - address_usize,
-                        source: Box::new(Error::malformed("page address overflowed")),
-                    })
-                })?;
+            // `page_count` is derived from `first_page..=last_page`, so this
+            // cannot leave the checked range; computing it here cannot fail and
+            // therefore cannot bypass the restore path.
+            let page = first_page + index * page_size;
             let mut previous: PAGE_PROTECTION_FLAGS = 0;
             // SAFETY: `page` is a page-aligned address inside a committed range
             // validated by `ensure_range_committed`, `page_size` is the system
@@ -399,11 +390,7 @@ impl ProcessHandle {
                 )
             };
             if succeeded == 0 {
-                let failure = CodeWriteFailure::Protect {
-                    address: page as u64,
-                    len: page_size,
-                    source: Box::new(last_error()),
-                };
+                let failure = protect_failure_value(page as u64, page_size, last_error());
                 let (restore, additional_restore_failures) =
                     self.restore_pages(&changed, page_size);
                 return Err(match restore {
@@ -427,11 +414,9 @@ impl ProcessHandle {
                 restore,
                 additional_restore_failures,
             }),
-            (Err(source), None) => Err(CodeWriteError::Failed(CodeWriteFailure::Write(Box::new(
-                source,
-            )))),
+            (Err(source), None) => Err(write_failure(source)),
             (Err(source), Some(restore)) => Err(CodeWriteError::RestoreFailedAfterFailure {
-                failure: CodeWriteFailure::Write(Box::new(source)),
+                failure: write_failure_value(source),
                 restore,
                 additional_restore_failures,
             }),
@@ -499,41 +484,35 @@ impl ProcessHandle {
                 )
             };
             if written == 0 {
-                return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
-                    address: current as u64,
-                    len: end - current,
-                    source: Box::new(last_error()),
-                }));
+                return Err(protect_failure(current as u64, end - current, last_error()));
             }
             if info.State != MEM_COMMIT {
-                return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
-                    address: current as u64,
-                    len: end - current,
-                    source: Box::new(Error::new(
+                return Err(protect_failure(
+                    current as u64,
+                    end - current,
+                    Error::new(
                         ErrorKind::InvalidAddress,
                         None,
                         format!("address {current:#x} is not committed memory"),
-                    )),
-                }));
+                    ),
+                ));
             }
             let base = info.BaseAddress as usize;
             let region_end = base.checked_add(info.RegionSize).ok_or_else(|| {
-                CodeWriteError::Failed(CodeWriteFailure::Protect {
-                    address: current as u64,
-                    len: end - current,
-                    source: Box::new(Error::malformed(
-                        "VirtualQueryEx returned a wrapping region",
-                    )),
-                })
+                protect_failure(
+                    current as u64,
+                    end - current,
+                    Error::malformed("VirtualQueryEx returned a wrapping region"),
+                )
             })?;
             if base > current || region_end <= current {
-                return Err(CodeWriteError::Failed(CodeWriteFailure::Protect {
-                    address: current as u64,
-                    len: end - current,
-                    source: Box::new(Error::malformed(
+                return Err(protect_failure(
+                    current as u64,
+                    end - current,
+                    Error::malformed(
                         "VirtualQueryEx returned a region that does not cover the queried address",
-                    )),
-                }));
+                    ),
+                ));
             }
             current = region_end.min(end);
         }
@@ -603,7 +582,13 @@ impl ProcessHandle {
     fn regions_with_paths(&self, fill_paths: bool) -> Result<Vec<RawRegion>, Error> {
         self.ensure_alive()?;
         let modules = if fill_paths {
-            self.modules().unwrap_or_default()
+            match self.modules() {
+                Ok(modules) => modules,
+                // Region paths are best effort, but a dead target must not be
+                // reported as a successful region list.
+                Err(error) if error.kind() == ErrorKind::ProcessExited => return Err(error),
+                Err(_) => Vec::new(),
+            }
         } else {
             Vec::new()
         };
@@ -1244,20 +1229,18 @@ fn module_contains(module: &RawModule, address: u64) -> bool {
 ///
 /// Windows paths can contain unpaired surrogates; keeping them as WTF-16 lets
 /// `PathBuf` name the actual file instead of a replacement-character path.
-fn wide_to_os_string(wide: &[u16]) -> OsString {
-    let end = wide
-        .iter()
+fn wide_end(wide: &[u16]) -> usize {
+    wide.iter()
         .position(|unit| *unit == 0)
-        .unwrap_or(wide.len());
-    OsString::from_wide(&wide[..end])
+        .unwrap_or(wide.len())
+}
+
+fn wide_to_os_string(wide: &[u16]) -> OsString {
+    OsString::from_wide(&wide[..wide_end(wide)])
 }
 
 fn wide_to_string(wide: &[u16]) -> String {
-    let end = wide
-        .iter()
-        .position(|unit| *unit == 0)
-        .unwrap_or(wide.len());
-    String::from_utf16_lossy(&wide[..end])
+    String::from_utf16_lossy(&wide[..wide_end(wide)])
 }
 
 fn checked_address(address: u64, len: usize) -> Result<usize, Error> {
@@ -1329,10 +1312,8 @@ fn timeout_millis(timeout: Option<Duration>) -> u32 {
     match timeout {
         None => u32::MAX,
         Some(timeout) => {
-            let millis = timeout.as_millis();
-            u32::try_from(millis)
-                .unwrap_or(u32::MAX - 1)
-                .min(u32::MAX - 1)
+            let millis = timeout.as_millis().min(u128::from(u32::MAX - 1));
+            u32::try_from(millis).unwrap_or(u32::MAX - 1)
         }
     }
 }
@@ -1452,6 +1433,26 @@ fn partial_transfer_error(code: u32, transferred: usize, requested: usize) -> Er
     } else {
         error
     }
+}
+
+fn write_failure_value(source: Error) -> CodeWriteFailure {
+    CodeWriteFailure::Write(Box::new(source))
+}
+
+fn write_failure(source: Error) -> CodeWriteError {
+    CodeWriteError::Failed(write_failure_value(source))
+}
+
+fn protect_failure_value(address: u64, len: usize, source: Error) -> CodeWriteFailure {
+    CodeWriteFailure::Protect {
+        address,
+        len,
+        source: Box::new(source),
+    }
+}
+
+fn protect_failure(address: u64, len: usize, source: Error) -> CodeWriteError {
+    CodeWriteError::Failed(protect_failure_value(address, len, source))
 }
 
 fn io_error(error: std::io::Error) -> Error {

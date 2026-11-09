@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use memdiver_sys::RawModule;
 
+use crate::region::find_range;
 use crate::{Address, Error, Result};
 
 /// An executable module loaded by the target process.
@@ -117,13 +118,12 @@ impl ModuleMap {
     /// Returns the module containing `address`, if any.
     #[must_use]
     pub fn find(&self, address: Address) -> Option<&Module> {
-        let index = self
-            .modules
-            .partition_point(|module| module.base() <= address);
-        index
-            .checked_sub(1)
-            .and_then(|index| self.modules.get(index))
-            .filter(|module| module.contains(address))
+        find_range(
+            &self.modules,
+            address,
+            |module| module.base().get(),
+            Module::contains,
+        )
     }
 
     /// Returns `true` when the snapshot contains no modules.

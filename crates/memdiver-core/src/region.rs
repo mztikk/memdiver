@@ -126,13 +126,12 @@ impl RegionMap {
     /// Returns the region containing `address`, if any.
     #[must_use]
     pub fn find(&self, address: Address) -> Option<&Region> {
-        let index = self
-            .regions
-            .partition_point(|region| region.base() <= address);
-        index
-            .checked_sub(1)
-            .and_then(|index| self.regions.get(index))
-            .filter(|region| region.contains(address))
+        find_range(
+            &self.regions,
+            address,
+            |region| region.base().get(),
+            Region::contains,
+        )
     }
 
     /// Returns `true` when the snapshot contains no regions.
@@ -146,6 +145,25 @@ impl RegionMap {
     pub fn len(&self) -> usize {
         self.regions.len()
     }
+}
+
+/// Finds the last item in a sorted slice whose base is at or before `address`
+/// and that contains the address.
+///
+/// Both [`RegionMap`] and [`ModuleMap`](crate::ModuleMap) use this so their
+/// lookup semantics cannot diverge. Items must be sorted by `base` and their
+/// ranges must not overlap.
+pub(crate) fn find_range<T>(
+    items: &[T],
+    address: Address,
+    base: impl Fn(&T) -> u64,
+    contains: impl Fn(&T, Address) -> bool,
+) -> Option<&T> {
+    let index = items.partition_point(|item| base(item) <= address.get());
+    index
+        .checked_sub(1)
+        .and_then(|index| items.get(index))
+        .filter(|item| contains(item, address))
 }
 
 #[cfg(test)]
